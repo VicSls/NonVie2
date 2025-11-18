@@ -170,28 +170,211 @@ Cdata <- data_clean %>%
     -id
   ) 
 ##########################################################################
-#GAM felix
-Cdata <- data_clean
+library("readxl")
+library("dplyr")
+library("ggplot2")
+library("MASS")
+library("mgcv")
+library("caret")
+library("gridExtra")
+library("parallel")
+library("tidyr")
+library("plyr")
+library("plotrix")
+
+#Prepare the data
+data<-ulb_data
+data_clean <- data %>% filter(!is.na(claim_nb_tpl_md))
+data_clean <- data_clean %>% filter(!is.na(claim_nb_tpl_bi))
+
+
+#exposition au risque sup à 1
+data_clean <- data_clean %>%
+  mutate(admi_risk_exposure = pmin(admi_risk_exposure, 1))
+
+# Nous faisons cela pour conserver l'information (supposant que NA signifie 0 année sans sinistre)
+data_clean <- data_clean %>% 
+  mutate(veh_years_claim_free = ifelse(is.na(veh_years_claim_free), 0, veh_years_claim_free))%>% 
+  mutate(driv_y_age = ifelse(is.na(driv_y_age), 0, driv_y_age))
+
+#categoriel to numeric
+data_clean <- data_clean %>% 
+  mutate(
+    claim_nb_tpl_md = as.numeric(claim_nb_tpl_md), 
+    claim_nb_tpl_bi = as.numeric(claim_nb_tpl_bi)  
+  )
+
+###############################################################################
+summary(data_clean)
+#Distributions of the data
+data_clean %>%
+  dplyr::select(where(is.numeric),-id,-geo_postcode_lng,-geo_postcode_lat,-driv_y_add_flg) %>%
+  pivot_longer(cols = everything()) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+  facet_wrap(~ name, scales = "free") +
+  labs(title = "Histograms of Numerical Variables") +
+  theme_minimal()
+
+#Intro: tests sur les v.a.
+
+#Nbr total d'exposition aux risques en année
+format(sum(data_clean$admi_risk_exposure))
+
+#Nbr de police par mois d'exposition
+table(cut(data_clean$admi_risk_exposure, breaks = seq(from = 0, to = 1,by = 1/12), labels = 1:12))
+
+#% du portefeuille par mois d'exposition
+round(prop.table(table(cut(data_clean$admi_risk_exposure, breaks = seq(from = 0, to = 1,by = 1/12), labels = 1:12))), 4)
+
+#graph du nbr d'exposure 
+Exposure.summary = cut(data_clean$admi_risk_exposure, breaks = seq(from = 0, to = 1,by = 1/12))
+levels(Exposure.summary) = 1:12
+ggplot()+geom_bar(aes(x=Exposure.summary)) + xlab("Number of months") + ggtitle("Exposure in months")
+
+#Nbr claim
+ggplot(data_clean, aes(x=Tot_claim))+geom_bar()+
+  geom_text(stat='count', aes(label=..count..), vjust=-1)+ylim(c(0,210000))+
+  ylab("")+ xlab("Number of Claims")+  ggtitle("Proportion of policies by number of claims")
+
+#We can compute the average claim frequency in this portfolio, taking into account the different exposures.
+#resultat rejoint les 5% du prof
+sum(data_clean$Tot_claim) / sum(data_clean$admi_risk_exposure)
+
+#veh_power
+#nbr total de véhicule par puissance
+table(data_clean$veh_power)
+
+#Exposition des véhicules par puissance 
+
+Power.summary = ddply(data_clean, .(veh_power), summarize, totalExposure = sum(admi_risk_exposure), Number.Observations= length(admi_risk_exposure))
+
+ggplot(Power.summary, aes(x=veh_power, y=totalExposure, fill=veh_power)) + 
+  geom_bar(stat="identity")+
+  ylab("Exposure in years")+
+  geom_text(stat='identity', aes(label=round(totalExp, 0), color=veh_power), vjust=-0.5)+
+  guides(fill=FALSE, color=FALSE)
+
+#Nbr de claim en proportion de l'exposition au risque
+Power.summary = ddply(data_clean, .(veh_power), summarize, totalExposure = sum(admi_risk_exposure), Number.Observations = length(admi_risk_exposure), Number.Claims = sum(Tot_claim), Obs.Claim.Frequency = sum(Tot_claim)/sum(admi_risk_exposure))
+ggplot(Power.summary, aes(x=veh_power, y=Obs.Claim.Frequency, fill=veh_power)) + 
+  geom_bar(stat="identity")+
+  ylab("Nbr de claim en proportion de l'exposition au risque")+
+  geom_text(stat='identity', aes(label=round(totalExposure, 0), color=veh_power), vjust=-0.5)+
+  guides(fill=FALSE, color=FALSE)
+
+#Same+ ligne rouge qui correspond à la moyenne du portefeuille
+portfolio.cf = sum(data_clean$Tot_claim)/ sum(data_clean$admi_risk_exposure)
+ggplot(Power.summary) + geom_bar(stat="identity", aes(x=veh_power, y=Obs.Claim.Frequency, fill=veh_power)) + 
+  geom_line(aes(x = as.numeric(veh_power),y=portfolio.cf), color="red") + guides(fill=FALSE)
+
+#veh_age
+#Nbr tot, mais pas relater à l'exposion
+ggplot(data_clean, aes(x=veh_age)) + geom_bar()  + xlab("Age of the Car")
+#Par rapport à l'exposition, on voit que les plots se ressemblent
+CarAge.summary = ddply(data_clean, .(veh_age), summarize, totalExposure = sum(admi_risk_exposure), Number.Observations = length(admi_risk_exposure))
+ggplot(CarAge.summary, aes(x=veh_age, y=totalExposure)) + geom_bar(stat='identity') + ylab("Exposure in years")
+
+ggplot(data_clean[data_clean$veh_age==0,], aes(x="Exposure", y=admi_risk_exposure)) + geom_boxplot() +ggtitle("Exposure of new cars")
+
+CarAge.summary = ddply(data_clean, .(veh_age), summarize, totalExposure = sum(admi_risk_exposure), Number.Observations = length(admi_risk_exposure), Number.Claims = sum(Tot_claim), Obs.Claim.Freq = sum(Tot_claim)/sum(admi_risk_exposure))
+ggplot(CarAge.summary) + geom_bar(stat="identity", aes(x=veh_age, y=Obs.Claim.Freq, fill=veh_age)) + 
+  geom_line(aes(x = as.numeric(veh_age),y=portfolio.cf), color="red") + guides(fill=FALSE)
+
+#driv age
+DriverAge.summary = ddply(data_clean, .(driv_m_age), summarize, totalExposure = sum(admi_risk_exposure), Number.Observations = length(admi_risk_exposure), Number.Claims = sum(Tot_claim), Obs.Claim.Freq = sum(Tot_claim)/sum(admi_risk_exposure))
+
+#We can show the Exposures by Age of the Driver
+ggplot(DriverAge.summary, aes(x=driv_m_age, y=totalExposure)) + geom_bar(stat='identity', width=0.8) + ylab("Exposure in years")+xlab("Age of the Driver")
+
+#Observed claim frequency
+ggplot(DriverAge.summary) + geom_bar(stat="identity", aes(x=driv_m_age, y=Obs.Claim.Freq, fill=driv_m_age)) + 
+  geom_line(aes(x = as.numeric(driv_m_age),y=portfolio.cf), color="red") + guides(fill=FALSE)
+
+
+#Brand
+Brand.summary = ddply(data_clean, .(veh_make), summarize, totalExposure = sum(admi_risk_exposure), Number.Observations = length(admi_risk_exposure), Number.Claims = sum(Tot_claim), Obs.Claim.Freq = sum(Tot_claim)/sum(admi_risk_exposure))
+ggplot(Brand.summary, aes(x=reorder(veh_make,totalExposure), y=totalExposure, fill=veh_make)) +
+  geom_bar(stat='identity') +
+  coord_flip()+guides(fill=FALSE)+xlab("")+ylab("Exposure in years")
+
+#Observed claim frequency
+ggplot(Brand.summary, aes(x=reorder(veh_make,Obs.Claim.Freq), y=Obs.Claim.Freq, fill=veh_make)) +
+  geom_bar(stat='identity') +
+  coord_flip()+guides(fill=FALSE)+ ggtitle("Observed Claim Frequencies by Brand of the car")+xlab("")+ylab("Observed Claim Frequency")
+#ressemble à une approximation de la puissance véhicule ???
+
+
+#Gas
+Gas.summary = ddply(data_clean, .(veh_fuel), summarize, totalExposure = sum(admi_risk_exposure), Number.Observations = length(admi_risk_exposure), Number.Claims = sum(Tot_claim), Obs.Claim.Freq = sum(Tot_claim)/sum(admi_risk_exposure))
+ggplot(Gas.summary, aes(x=veh_fuel, y=totalExposure, fill=veh_fuel)) + geom_bar(stat="identity") + guides(fill=FALSE)
+#Usually diesel has a bigger impact portfolio, here hybrid and electricity are still big
+ggplot(Gas.summary, aes(x=veh_fuel, y=Obs.Claim.Freq, fill=veh_fuel)) + geom_bar(stat="identity") + guides(fill=FALSE)
+
+#Postcode or geo_munty_fr or coordonnée ?
+sapply(
+  data_clean[, c("geo_postcode_2digits", "geo_munty_fr")],
+  function(x) length(unique(x))
+)
+n_unique_coords <- nrow(
+  distinct(data_clean, geo_postcode_lat, geo_postcode_lng)
+)
+n_unique_coords
+#Donc geo_postcode_2digits est enough
+Postcode.summary = ddply(data_clean, .(geo_postcode_2digits), summarize, totalExposure = sum(admi_risk_exposure), Number.Observations = length(admi_risk_exposure), Number.Claims = sum(Tot_claim), Obs.Claim.Freq = sum(Tot_claim)/sum(admi_risk_exposure))
+twoord.plot(1:40,Postcode.summary$totalExposure,1:40,Postcode.summary$Obs.Claim.Freq,xlab="Region",
+            rylim=c(0,0.1),type=c("bar","p"), xticklab = Postcode.summary$geo_postcode_2digits, ylab = "Exposure", rylab = "Observed Claim Frequency")
+
+#2nd selection dataset de ce qu'on a besoin, j'enlève l'année mais pourrait être utile à l'avenir
+Cdata <- data_clean %>% 
+  dplyr::select(
+    #-geo_munty_fr, 
+    #-geo_province_fr, 
+    #-geo_region_fr, 
+    #-geo_postcode_lat,
+    #-geo_postcode_lng, 
+    -id,
+    -purpose,
+    #-admi_risk_year
+  ) 
+#on enlève purpose car 1 seul classe, on a perdu les autres classes 
+#car ils étaient NA
+##########################################################################
+#GAM claim_nb_tpl_md
 
 set.seed(123) # For reproducibility
-train_index <- createDataPartition(Cdata$Tot_claim, p = 0.8, list = FALSE)
+Cdata$offset_link <- log(Cdata$admi_risk_exposure)
+train_index <- createDataPartition(Cdata$claim_nb_tpl_md,times=1, p = 0.8, list = FALSE)
 train_set <- Cdata[train_index, ]
 val_set <- Cdata[-train_index, ]
 
-# Check the sizes of each set
-cat("Original training set size:", nrow(Cdata), "\n")
-cat("New training set size:", nrow(train_set), "\n")
-cat("Validation set size:", nrow(val_set), "\n")
+#au lieu de mettre si il y a un deuxième driver, je mets juste l'âge du deuxième driver
+y<- c("claim_nb_tpl_md")
+vars_all= c("veh_years_claim_free", "veh_age", 
+            "veh_power", "veh_value",
+            "veh_weight" , "cont_seniority"
+            ,"driv_m_age","driv_y_age",
+            "veh_fuel","veh_make", 
+            "veh_seats", "veh_type", 
+            "veh_use", "geo_postcode_2digits",
+            "geo_munty_fr","geo_province_fr",
+            "geo_region_fr", "geo_postcode_lat",
+            "geo_postcode_lng " ,"admi_risk_year" )
 
-#Gam model
-#Prepare the data
-Cdata$veh_make <- as.factor(Cdata$veh_make)
-Cdata$veh_type <- as.factor(Cdata$veh_type)
-Cdata$veh_use <- as.factor(Cdata$veh_use)
+for (var in vars_all) {
+  cat(var, ": length =", length(Cdata[[var]]), 
+      ", NA count =", sum(is.na(Cdata[[var]])), 
+      ", Unique values =", length(unique(Cdata[[var]])), "\n")
+}
 
-vars <- c("Tot_claim", "veh_age", "veh_power", "veh_value", "driv_m_age", 
-          "cont_seniority", "veh_seats", "veh_weight", "veh_make", "veh_type", 
-          "veh_use", "admi_risk_exposure")
+vars <- c( "veh_years_claim_free", "veh_age", 
+           "veh_power", "veh_value",
+           "veh_weight" , "cont_seniority"
+           ,"driv_m_age","driv_y_age",
+           "veh_fuel","veh_make", 
+           "veh_seats", "veh_type", 
+           "veh_use", "geo_postcode_2digits"
+)
 
 for (var in vars) {
   cat(var, ": length =", length(Cdata[[var]]), 
@@ -199,63 +382,233 @@ for (var in vars) {
       ", Unique values =", length(unique(Cdata[[var]])), "\n")
 }
 
-test_variable <- function(var_name) {
+
+#On va tester claim_nb_tpl_md //  admi_risk_exposure est dans l'offset
+#Je ne prends pas en compte de l'âge de l'autre conducteur, mais déjà si y en a 1
+
+
+formula <- function(var_name, data) {
+  v <- data[[var_name]]
+  #Binaire to facteur
+  if (is.numeric(v) && length(unique(v)) <= 2) {
+    as.formula(
+      paste("claim_nb_tpl_md ~ factor(", var_name, ") + offset(offset_link)
+)")
+    )
+  } 
+  #continue to spline
+  else if (is.numeric(v)) {
+    as.formula(
+      paste("claim_nb_tpl_md ~ s(", var_name, ") + offset(offset_link
+)")
+    )
+  } else {
+    # facteur
+    as.formula(
+      paste("claim_nb_tpl_md ~", var_name, "+ offset(offset_link)")
+    )
+  }
+}
+
+transfo<- function(var_name, data) {
+  v <- data[[var_name]]
+  
+  if (is.numeric(v) && length(unique(v)) <= 2) {
+    # binaire to facteur
+    return(paste0("factor(", var_name, ")"))
+  } else if (is.numeric(v)) {
+    # continue to spline
+    return(paste0("s(", var_name, ")"))
+  } else {
+    # facteur → tel quel
+    return(var_name)
+  }
+}
+
+transfo_var <- sapply(vars, transfo, data = train_set)
+offset<-log(train_set$admi_risk_exposure)
+
+#intercept mean frequency, meanfrequency is consitent with expected
+#family=quasipoisson() ou nb()
+fit0<-gam(claim_nb_tpl_md~1, data=train_set, poisson(link = "log"), offset=offset_link,  method = "REML")
+mean_frequency <- exp(coef(fit0))
+mean_frequency
+
+
+#Firt everything gam
+x<-as.formula(paste("claim_nb_tpl_md ~", paste(transfo_var, collapse = " + ")))
+
+fit_all <- gam(as.formula(paste("claim_nb_tpl_md ~", 
+                                paste(transfo_var, collapse = " + ")))
+               ,family = poisson(link = "log"), data = train_set, 
+               offset = offset, method = "REML")
+summary (fit_all)
+
+# Utile: cont_seniority + driv_m_age+ veh_value + veh_age + veh_years_claim_free
+#geo_postcode_2digits5600 
+
+#figure margin ?
+plot(fit_all, pages = 1, residuals = TRUE, all.terms = TRUE)
+
+
+#Second test variable + model on significativ one by one 
+
+
+pvalue_solo_test <- function(var_name, data = train_set) {
+  form<-formula(var_name, data)
+  v<-data[[var_name]]
+  res <- tryCatch({
+    fit <- gam(form, family = poisson(link = "log"), data = data,  method = "REML")
+    s   <- summary(fit)
+    
+    # p-value principale
+    if (is.numeric(v) && length(unique(v)) > 2) {
+      # cas s(variable)
+      p_val <- s$s.pv[1]
+    } else {
+      # cas factor(..) ou variable catégorielle
+      tab <- s$p.table
+      if (nrow(tab) > 1) {
+        p_val <- tab[2, 4]  # p-value du 1er coef non-intercept
+      } else {
+        p_val <- NA
+      }
+    }
+    
+    data.frame(
+      variable   = var_name,
+      p_value    = p_val,
+      significant_5pct = ifelse(!is.na(p_val) & p_val < 0.05, TRUE, FALSE),
+      error      = NA_character_
+    )
+  })
+  return(res)
+}
+
+# appliquer à toutes les variables
+results <- do.call(rbind, lapply(vars, pvalue_solo_test))
+results
+
+#tester avec vars_all, autre variable ressorte ?
+results_all <- do.call(rbind, lapply(vars_all, pvalue_solo_test))
+results_all
+#garde:veh_years_claim_free + veh_age+ veh_value+ veh_weight 
+#+ cont_seniority+ driv_m_age +veh_fuel+ veh_type +veh_use 
+vars_s <- subset(results, significant_5pct)$variable
+vars_s
+
+transfo_var_s <- sapply(vars_s, transfo, data = train_set)
+
+fit_s <- gam(as.formula(paste("claim_nb_tpl_md ~", 
+                              paste(transfo_var_s, collapse = " + ")))
+             ,family = poisson(link = "log"), data = train_set, 
+             offset = offset,  method = "REML")
+summary(fit_s)
+#Significativ : veh_fuelgasoil(0.05) + veh_usepersonal(0.001) +veh_years_claim_free(0.0001)
+#veh_value(0.05) + cont_seniority(0.0001) + driv_m_age (0.0001)+ veh_age (0.001)
+
+
+#Third : Iterative backshifting, will try to improve log vraisemblance 
+
+
+fits <- vector("list", length(vars))
+#Initialisation des modèles
+names(fits) <- vars
+for (v in vars) {
+  form <- formula(v, train_set)
+  fits[[v]] <- gam(form, family = poisson(link = "log"), data = train_set, method = "REML")
+}
+
+safe_predict <- function(model, newdata) {
   tryCatch({
-    # Simple model with just one variable
-    test_model <- gam(Tot_claim ~ s(get(var_name)) + offset(log(admi_risk_exposure)),
-                      family = poisson, data = Cdata)
-    return(paste(var_name, ": OK"))
+    pred <- predict(model, newdata = newdata, type = "link")
+    as.numeric(pred)  # Retourne un vecteur simple
   }, error = function(e) {
-    return(paste(var_name, ": ERROR -", e$message))
+    warning("Erreur dans predict(), retourne zéros: ", e$message)
+    rep(0, nrow(newdata))
   })
 }
 
-results <- sapply(vars, test_variable)
-print(results)
-
-# GAM-Model
-gam_model <- gam(Tot_claim ~ 
-                   s(admi_risk_exposure) + 
-                   s(veh_years_claim_free) +
-                   s(veh_age) +
-                   s(veh_power) +
-                   s(veh_value) +
-                   s(veh_weight) +
-                   s(cont_seniority) +
-                   s(driv_m_age) +
-                   factor(veh_fuel) +
-                   factor(veh_type) +
-                   factor(veh_use) +
-                   factor(geo_postcode_2digits),
-                 data = Cdata,
-                 family = poisson(link = "log"),
-                 method = "ML")
-plot(gam_model, pages = 1, residuals = TRUE, all.terms = TRUE)
-
-#Validation on the training set & compute loss_function
-training_predictions <-predict(gam_model, newdata = train_set, type = "response")
-
-total_loss_training <- 0
-for (i in length(training_predictions)) {
-  loss <- 2*(train_set$Tot_claim[i]*log(train_set$tot_claim[i]/training_predictions[i])-(Cdata$Tot_claom[i]-training_predictions[i]))
-  total_loss_training = total_loss_training + loss
+get_logLik <- function(fits, data) {
+  #donne la contribution de la variable au log-taux
+  #liste de vecteurs de prédictions
+  #on les sommes
+  link_sum <- rep(0, nrow(data))
+  for (fit_name in names(fits)) {
+    pred <- safe_predict(fits[[fit_name]], data)
+    link_sum <- link_sum + pred
+  }  
+  # λ_i = exposition * exp(somme des effets)
+  lambda <- data$admi_risk_exposure * exp(link_sum)
+  
+  # somme log-vraisemblance de Poisson globale
+  #On va évalué le système
+  sum(dpois(x = data$claim_nb_tpl_md, lambda = lambda, log = TRUE))
 }
-total_loss_training = total_loss_training/length(train_set$Tot_claim)
-total_loss_training
 
-#Validation on the validation set & compute loss_function
-validation_predictions <- predict(gam_model, newdata = val_set, type = "response")
-validation_predictions
+#log-vraisemblance initiale avec les premiers modèles univariés
+LL0 <- get_logLik(fits, train_set)
+LL0
 
-total_loss_validation <- 0
-for (i in length(validation_predictions)) {
-  loss <- 2*(val_set$Tot_claim[i]*log(val_set$Tot_claim[i]/validation_predictions[i])-(Val_set$Tot_claim[i]-validation_predictions[i]))
-  total_loss_validation = total_loss_validation + loss
+#seuil de cv
+epsilon  <- 1e-4
+#stopper algo:
+max_iter <- length(vars)
+iter=0
+
+#boucle backshifting
+repeat {
+  iter <- iter + 1
+  # Pour chaque variable, on refait son modèle en mettant les 
+  #autres dans l'offset
+  
+  for (v in sample(vars)) {
+    # Contribution des autres variables sur l'échelle du lien
+    other_fits <- fits[names(fits) != v]
+    #donne la somme des contributions des autres variables au log-taux
+    link_others <- rep(0, nrow(train_set))
+    for (fit_name in names(other_fits)) {
+      pred <- predict(other_fits[[fit_name]], newdata = train_set, type = "link")
+      # Convertir en vecteur numérique simple sans attributs
+      link_others <- link_others + as.numeric(pred)
+    }    
+    #NewOffset = log(expo) + somme des autres effets
+    train_set$offset_link <- log(train_set$admi_risk_exposure) + link_others
+    
+    # Nouvelle formule
+    form_v <- formula(v, train_set)
+    
+    # Modèle de v, conditionnellement aux autres dans l'offset
+    fits[[v]] <- gam(form_v, family = poisson(link = "log"), data = train_set,  method = "REML")
+  }
+  
+  # Nouvelle log-vraisemblance après avoir mis à jour toutes les variables
+  LLi <- get_logLik(fits, train_set)
+  cat("Itération:", iter,"variable", v,  "  LL0:", LL0, "  LLi:", LLi, "\n")
+  
+  # Critère de convergence relatif
+  if (abs(LLi - LL0) / (abs(LL0) + 1e-12) < epsilon) {
+    cat("Convergence atteinte.\n")
+    break
+  }
+  
+  if (iter >= max_iter) {
+    cat("Nombre maximum d'itérations atteint.\n")
+    break
+  }
+  
+  LL0 <- LLi
 }
-total_loss_validation = total_loss_validation/length(validation_set$claim_nb_tpl_md)
-total_loss_validation
 
-#Validation on Cross-Validation & compute loss_function
+# somme des effets univariés nets
+link_sum_final <- Reduce(`+`,lapply(fits, predict, newdata = train_set, type = "link"))
+
+lambda_hat <- train_set$admi_risk_exposure * exp(link_sum_final)
+head(lambda_hat)
+
+
+
+#Forth : Cross-Validation gam
 folds <- createFolds(train_set$Tot_claim, k = 10, returnTrain = TRUE)
 
 total_loss_cv_mean <- 0
@@ -285,7 +638,7 @@ for(i in 1:10) {
   
   total_loss_cv <- 0
   for (i in length(cv_prediction)) {
-    loss <- 2*(test_fold$Tot_claim[i]*log(test_fold$Tot_claim[i]/cv_prediction[i])-(test_fold$Tot_claim[i]-cv_prediction[i]))
+    loss <- 2*(test_fold$Tot_claim[i]*log(test_fold$tot_claim[i]/cv_prediction[i])-(test_fold$Tot_claim[i]-cv_prediction[i]))
     total_loss_cv = total_loss_cv + loss
   }
   total_loss_cv = total_loss_cv/length(test_fold$Tot_claim)
@@ -297,6 +650,40 @@ for(i in 1:10) {
 results <- sapply(vars, test_variable)
 print(results)
 
+#Fifth : all the same as before but with binomial negativ
+
+
+#Validation on the training set & compute loss_function
+training_predictions <-predict(gam_model, newdata = train_set, type = "response")
+
+total_loss_training <- 0
+for (i in length(training_predictions)) {
+  loss <- 2*(train_set$Tot_claim[i]*log(train_set$tot_claim[i]/training_predictions[i])-(Cdata$Tot_claom[i]-training_predictions[i]))
+  total_loss_training = total_loss_training + loss
+}
+total_loss_training = total_loss_training/length(train_set$Tot_claim)
+total_loss_training
+
+#Validation on the validation set & compute loss_function
+validation_predictions <- predict(gam_model, newdata = val_set, type = "response")
+validation_predictions
+
+total_loss_validation <- 0
+for (i in length(validation_predictions)) {
+  loss <- 2*(val_set$Tot_claim[i]*log(val_set$Tot_claim[i]/validation_predictions[i])-(Val_set$Tot_claim[i]-validation_predictions[i]))
+  total_loss_validation = total_loss_validation + loss
+}
+total_loss_validation = total_loss_validation/length(validation_set$claim_nb_tpl_md)
+total_loss_validation
+
+AIC(m_pois)
+AIC(m_nb)
+pred_pois <- predict(m_pois, newdata = val_set, type="response")
+RMSE_pois <- sqrt(mean((val_set$claim_nb_tpl_md - pred)^2))
+pred_nb <- predict(m_nb, newdata = val_set, type="response")
+RMSE_nb <- sqrt(mean((val_set$claim_nb_tpl_md - pred)^2))
+
+#####################################################################
 #Random Forests
 install.packages("randomForest")
 install.packages("rfCountData")
