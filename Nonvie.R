@@ -15,7 +15,7 @@ data<-ulb_data
 data_clean <- data %>% filter(!is.na(claim_nb_tpl_md))
 data_clean <- data_clean %>% filter(!is.na(claim_nb_tpl_bi))
 
-#exposition au risque sup à 1
+#exposition au risque sup à 1, est-ce possible que expo peut être supérieur 
 data_clean <- data_clean %>%
   mutate(admi_risk_exposure = pmin(admi_risk_exposure, 1))
 
@@ -218,7 +218,7 @@ for (var in vars) {
 #Je ne prends pas en compte de l'âge de l'autre conducteur, mais déjà si y en a 1
 
 
-formula <- function(var_name, data) {
+form <- function(var_name, data) {
   v <- data[[var_name]]
   #Binaire to facteur
   if (is.numeric(v) && length(unique(v)) <= 2) {
@@ -256,7 +256,7 @@ transfo<- function(var_name, data) {
   }
 }
 
-transfo_var <- sapply(vars, transfo, data = train_set)
+transfo_var <- sapply(vars_all, transfo, data = train_set)
 offset<-log(train_set$admi_risk_exposure)
 
 #intercept mean frequency, meanfrequency is consitent with expected
@@ -275,9 +275,10 @@ fit_all <- gam(as.formula(paste("claim_nb_tpl_md ~",
                offset = offset, method = "REML")
 summary (fit_all)
 
-# Utile: cont_seniority + driv_m_age+ veh_value + veh_age + veh_years_claim_free
-#geo_postcode_2digits5600 
 
+#veh_make + veh_use + veh_years_claim_free + veh_age
+# veh_value + cont_seniority + driv_m_age
+ 
 #figure margin ?
 plot(fit_all, pages = 1, residuals = TRUE, all.terms = TRUE)
 
@@ -286,7 +287,7 @@ plot(fit_all, pages = 1, residuals = TRUE, all.terms = TRUE)
 
 
 pvalue_solo_test <- function(var_name, data = train_set) {
-  form<-formula(var_name, data)
+  form<-form(var_name, data)
   v<-data[[var_name]]
   res <- tryCatch({
     fit <- gam(form, family = poisson(link = "log"), data = data,  method = "REML")
@@ -316,17 +317,17 @@ pvalue_solo_test <- function(var_name, data = train_set) {
   return(res)
 }
 
-# appliquer à toutes les variables
-results <- do.call(rbind, lapply(vars, pvalue_solo_test))
+results <- do.call(rbind, lapply(vars_all, pvalue_solo_test))
 results
 
-#tester avec vars_all, autre variable ressorte ?
-results_all <- do.call(rbind, lapply(vars_all, pvalue_solo_test))
-results_all
-#garde:veh_years_claim_free + veh_age+ veh_value+ veh_weight 
-#+ cont_seniority+ driv_m_age +veh_fuel+ veh_type +veh_use 
-vars_s <- subset(results, significant_5pct)$variable
+vars_s<- subset(results, significant_5pct)$variable
 vars_s
+
+#"veh_years_claim_free" "veh_age"              "veh_value"           
+# "veh_weight"           "cont_seniority"       "driv_m_age"          
+# "veh_fuel"             "veh_type"             "veh_use"             
+# "geo_region_fr"        "geo_postcode_lat"     "geo_postcode_lng "   
+
 
 transfo_var_s <- sapply(vars_s, transfo, data = train_set)
 
@@ -337,110 +338,156 @@ fit_s <- gam(as.formula(paste("claim_nb_tpl_md ~",
 summary(fit_s)
 #Significativ : veh_fuelgasoil(0.05) + veh_usepersonal(0.001) +veh_years_claim_free(0.0001)
 #veh_value(0.05) + cont_seniority(0.0001) + driv_m_age (0.0001)+ veh_age (0.001)
+#New list of vars
+vars<- c("veh_years_claim_free", "veh_age",
+         "veh_value", "veh_weight"
+         ,"cont_seniority","driv_m_age",
+         "veh_fuel","veh_type"
+         ,"veh_use" ,"geo_region_fr"
+         ,"geo_postcode_lat","geo_postcode_lng"   
+)
 
 
-#Third : Iterative backshifting, will try to improve log vraisemblance 
+# Third : Nested model
 
 
-fits <- vector("list", length(vars))
-#Initialisation des modèles
-names(fits) <- vars
-for (v in vars) {
-  form <- formula(v, train_set)
-  fits[[v]] <- gam(form, family = poisson(link = "log"), data = train_set, method = "REML")
+compare_models <- function(base_model, v, data = train_set) {
+  base_formula_str <- paste(deparse(formula(base_model)), collapse = " ")
+  
+  new_formula_str <- paste0(base_formula_str, " + ", transfo(v, data))
+  new_formula <- as.formula(new_formula_str)
+  
+  new_model <- gam(new_formula, family = poisson(link = "log"), data = data, offset = offset_link, method = "REML")
+  
+  # Test de rapport de vraisemblance
+  lrtest <- anova(base_model, new_model, test = "Chisq")
+  
+  # AIC
+  aic_diff <- AIC(new_model) - AIC(base_model)
+  
+  list(
+    variable = v,  
+    new_model = new_model,
+    p_value = lrtest$`Pr(>Chi)`[2],
+    aic_change = aic_diff,
+    significant = lrtest$`Pr(>Chi)`[2] < 0.05
+  )
 }
 
-safe_predict <- function(model, newdata) {
-  tryCatch({
-    pred <- predict(model, newdata = newdata, type = "link")
-    as.numeric(pred)  # Retourne un vecteur simple
-  }, error = function(e) {
-    warning("Erreur dans predict(), retourne zéros: ", e$message)
-    rep(0, nrow(newdata))
-  })
+# Intercept model
+base_model <- fit0
+
+# Variables sélectionnées et restantes
+s_vars <- c()
+remain_vars <- vars
+
+set.seed(123)  
+for (var in sample(remain_vars)) {
+  result <- compare_models(base_model, var)
+  if (!is.na(result$significant) && result$significant) {
+    s_vars <- c(s_vars, var)
+    base_model <- result$new_model  
+  } }
+
+
+s_vars
+#Choose:"geo_postcode_2digits" "veh_make"             "veh_age"             
+#"cont_seniority"       "veh_value"            "driv_m_age"          
+#"veh_years_claim_free" "veh_seats"(No way)            "driv_y_age"          
+# "veh_fuel
+
+#Among : "veh_years_claim_free" "veh_age"              "veh_power"           
+#"veh_value"            "veh_weight"           "cont_seniority"      
+#"driv_m_age"           "driv_y_age"           "veh_fuel"            
+#"veh_make"             "veh_seats"            "veh_type"            
+#"veh_use"              "geo_postcode_2digits"
+
+vars<- c("veh_years_claim_free", "veh_make",
+         "veh_age","geo_postcode_2digits",
+         "veh_value", "veh_weight"
+         ,"cont_seniority","driv_m_age",
+         "veh_fuel","veh_type"
+         ,"veh_use" ,"geo_region_fr"
+         ,"geo_postcode_lat","geo_postcode_lng"   
+)
+
+# Interactions bivariées pour var signi
+
+cor_matrix <- cor(train_set[vars],use = "pairwise.complete.obs",method = "pearson")
+
+library(corrplot)
+
+# Créer une visualisation claire
+corrplot(cor_matrix, 
+         method = "color",
+         type = "upper",
+         order = "hclust",  
+         tl.cex = 0.8,      
+         tl.col = "black",
+         addCoef.col = "black",  
+         number.cex = 0.7,
+         title = "Matrice de corrélation de Pearson",
+         mar = c(0,0,1,0))
+
+upper.tri(cor_matrix)
+
+# Clustering pour identifier des groupes de variables corrélées
+hclust_cor <- hclust(as.dist(1 - abs(cor_matrix)))  # Distance = 1 - |correlation|
+
+# Visualiser le dendrogramme
+plot(hclust_cor, main = "Clustering des variables par corrélation",
+     xlab = "", sub = "")
+
+# Découper en groupes
+groups <- cutree(hclust_cor, k = 3)  # 3 groupes
+cat("\nGroupes de variables corrélées:\n")
+for(i in 1:3) {
+  cat("Groupe", i, ":", names(groups[groups == i]), "\n")
 }
 
-get_logLik <- function(fits, data) {
-  #donne la contribution de la variable au log-taux
-  #liste de vecteurs de prédictions
-  #on les sommes
-  link_sum <- rep(0, nrow(data))
-  for (fit_name in names(fits)) {
-    pred <- safe_predict(fits[[fit_name]], data)
-    link_sum <- link_sum + pred
-  }  
-  # λ_i = exposition * exp(somme des effets)
-  lambda <- data$admi_risk_exposure * exp(link_sum)
+interactions_to_test <- c(
+  "te(driv_m_age, veh_age)",           # Âge conducteur × âge véhicule
+  "te(veh_value, geo_region_fr)",      # Valeur véhicule × région
+  "ti(cont_seniority, driv_m_age)",    # Ancienneté × âge conducteur
+  "te(veh_power, driv_m_age)",         # Puissance × âge conducteur
+  "ti(veh_type, veh_fuel)"           # Type véhicule × carburant
   
-  # somme log-vraisemblance de Poisson globale
-  #On va évalué le système
-  sum(dpois(x = data$claim_nb_tpl_md, lambda = lambda, log = TRUE))
+)
+
+
+# Tester chaque interaction
+test_interaction <- function(base_formula, interaction_term, data = train_set) {
+  interaction_formula <- as.formula(paste(deparse(base_formula), "+", interaction_term))
+  interaction_model <- gam(interaction_formula, family = poisson(link = "log"), 
+                           data = data, offset = offset_link, method = "REML")
+  
+  base_model <- gam(base_formula, family = poisson(link = "log"), 
+                    data = data, offset = offset_link, method = "REML")
+  
+  lrtest <- anova(base_model, interaction_model, test = "Chisq")
+  
+  list(
+    interaction = interaction_term,
+    p_value = lrtest$`Pr(>Chi)`[2],
+    aic_change = AIC(interaction_model) - AIC(base_model),
+    significant = lrtest$`Pr(>Chi)`[2] < 0.05
+  )
 }
 
-#log-vraisemblance initiale avec les premiers modèles univariés
-LL0 <- get_logLik(fits, train_set)
-LL0
+# Appliquer les tests d'interaction
+base_formula <- formula(current_model)  # Le modèle final de l'étape 1
 
-#seuil de cv
-epsilon  <- 1e-4
-#stopper algo:
-max_iter <- length(vars)
-iter=0
-
-#boucle backshifting
-repeat {
-  iter <- iter + 1
-  # Pour chaque variable, on refait son modèle en mettant les 
-  #autres dans l'offset
-  
-  for (v in sample(vars)) {
-    # Contribution des autres variables sur l'échelle du lien
-    other_fits <- fits[names(fits) != v]
-    #donne la somme des contributions des autres variables au log-taux
-    link_others <- rep(0, nrow(train_set))
-    for (fit_name in names(other_fits)) {
-      pred <- predict(other_fits[[fit_name]], newdata = train_set, type = "link")
-      # Convertir en vecteur numérique simple sans attributs
-      link_others <- link_others + as.numeric(pred)
-    }    
-    #NewOffset = log(expo) + somme des autres effets
-    train_set$offset_link <- log(train_set$admi_risk_exposure) + link_others
-    
-    # Nouvelle formule
-    form_v <- formula(v, train_set)
-    
-    # Modèle de v, conditionnellement aux autres dans l'offset
-    fits[[v]] <- gam(form_v, family = poisson(link = "log"), data = train_set,  method = "REML")
-  }
-  
-  # Nouvelle log-vraisemblance après avoir mis à jour toutes les variables
-  LLi <- get_logLik(fits, train_set)
-  cat("Itération:", iter,"variable", v,  "  LL0:", LL0, "  LLi:", LLi, "\n")
-  
-  # Critère de convergence relatif
-  if (abs(LLi - LL0) / (abs(LL0) + 1e-12) < epsilon) {
-    cat("Convergence atteinte.\n")
-    break
-  }
-  
-  if (iter >= max_iter) {
-    cat("Nombre maximum d'itérations atteint.\n")
-    break
-  }
-  
-  LL0 <- LLi
+for (interaction in interactions_to_test) {
+  result <- test_interaction(base_formula, interaction)
+  cat("Interaction", interaction, ": p =", result$p_value, 
+      ", AIC change =", result$aic_change, "\n")
 }
-
-# somme des effets univariés nets
-link_sum_final <- Reduce(`+`,lapply(fits, predict, newdata = train_set, type = "link"))
-
-lambda_hat <- train_set$admi_risk_exposure * exp(link_sum_final)
-head(lambda_hat)
-
 
 
 #Forth : Cross-Validation gam
-folds <- createFolds(train_set$Tot_claim, k = 10, returnTrain = TRUE)
+
+
+folds <- createFolds(train_set$claim_nb_tpl_md, k = 10, returnTrain = TRUE)
 
 total_loss_cv_mean <- 0
 for(i in 1:10) {
@@ -481,6 +528,10 @@ for(i in 1:10) {
 results <- sapply(vars, test_variable)
 print(results)
 
+
+
+
+
 #Fifth : all the same as before but with binomial negativ
 
 
@@ -514,7 +565,7 @@ RMSE_pois <- sqrt(mean((val_set$claim_nb_tpl_md - pred)^2))
 pred_nb <- predict(m_nb, newdata = val_set, type="response")
 RMSE_nb <- sqrt(mean((val_set$claim_nb_tpl_md - pred)^2))
 
-#####################################################################
+##################################################################################################################################
 #Random Forests
 install.packages("randomForest")
 install.packages("rfCountData")
@@ -544,8 +595,6 @@ loss_function <- function(test_set, prediction, var1) {
 }
 
 #do a regression tree
-
-
 
 tree <- rpart(Tot_claim ~ veh_age+veh_power+veh_value+veh_power+veh_weight+veh_use+veh_years_claim_free+cont_seniority+driv_m_age+veh_type+veh_use+
                 offset(log(admi_risk_exposure)),data=train_set,
