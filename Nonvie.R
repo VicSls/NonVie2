@@ -350,47 +350,16 @@ vars<- c("veh_years_claim_free", "veh_age",
 
 # Third : Nested model
 
-
-compare_models <- function(base_model, v, data = train_set) {
-  base_formula_str <- paste(deparse(formula(base_model)), collapse = " ")
-  
-  new_formula_str <- paste0(base_formula_str, " + ", transfo(v, data))
-  new_formula <- as.formula(new_formula_str)
-  
-  new_model <- gam(new_formula, family = poisson(link = "log"), data = data, offset = offset_link, method = "REML")
-  
-  # Test de rapport de vraisemblance
-  lrtest <- anova(base_model, new_model, test = "Chisq")
-  
-  # AIC
-  aic_diff <- AIC(new_model) - AIC(base_model)
-  
-  list(
-    variable = v,  
-    new_model = new_model,
-    p_value = lrtest$`Pr(>Chi)`[2],
-    aic_change = aic_diff,
-    significant = lrtest$`Pr(>Chi)`[2] < 0.05
-  )
-}
-
-# Intercept model
-base_model <- fit0
-
-# Variables sélectionnées et restantes
-s_vars <- c()
-remain_vars <- vars
-
-set.seed(123)  
-for (var in sample(remain_vars)) {
-  result <- compare_models(base_model, var)
-  if (!is.na(result$significant) && result$significant) {
-    s_vars <- c(s_vars, var)
-    base_model <- result$new_model  
-  } }
+vars<- c("veh_years_claim_free", "veh_make",
+         "veh_age","geo_postcode_2digits",
+         "veh_value", "veh_weight"
+         ,"cont_seniority","driv_m_age",
+         "veh_fuel","veh_type"
+         ,"veh_use" ,"geo_region_fr"
+         ,"geo_postcode_lat","geo_postcode_lng"   
+)
 
 
-s_vars
 #Choose:"geo_postcode_2digits" "veh_make"             "veh_age"             
 #"cont_seniority"       "veh_value"            "driv_m_age"          
 #"veh_years_claim_free" "veh_seats"(No way)            "driv_y_age"          
@@ -402,17 +371,54 @@ s_vars
 #"veh_make"             "veh_seats"            "veh_type"            
 #"veh_use"              "geo_postcode_2digits"
 
+offset<-log(train_set$admi_risk_exposure)
+compare_models <- function(base_model, v, data = train_set) {
+  +   base_formula_str <- paste(deparse(formula(base_model)), collapse = " ")
+  +   
+    +   new_formula_str <- paste0(base_formula_str, " + ", transfo(v, data))
+    +   new_formula <- as.formula(new_formula_str)
+    +   
+      +   new_model <- gam(new_formula, family = poisson(link = "log"), data = data, offset = offset_link, method = "REML")
+      +   
+        +   # Test de rapport de vraisemblance
+        +   lrtest <- anova(base_model, new_model, test = "Chisq")
+        +   
+          +   # AIC
+          +   aic_diff <- AIC(new_model) - AIC(base_model)
+          +   
+            +   list(
+              +     variable = v,  
+              +     new_model = new_model,
+              +     p_value = lrtest$`Pr(>Chi)`[2],
+              +     aic_change = aic_diff,
+              +     significant = lrtest$`Pr(>Chi)`[2] < 0.05
+              +   )
+          + }
+# Intercept model
+base_model <- fit0
+#New: s_vars
+#[1] ""              "geo_postcode_lng" wtf only that    "veh_type"            
+#[4] ""             ""           ""           
+#[7] "" ""       ""
+#[10] "veh_use"              "driv_m_age"           "veh_fuel"            
+#Choose:"" ""             ""             
+#""       ""            "driv_m_age"          
+#"" "veh_seats"(No way)            "driv_y_age"          
+# "veh_fuel
+#veh_weight in only 1 tech no the other
 vars<- c("veh_years_claim_free", "veh_make",
          "veh_age","geo_postcode_2digits",
-         "veh_value", "veh_weight"
-         ,"cont_seniority","driv_m_age",
+         "veh_value","cont_seniority", "veh_weight"
+         ,"driv_m_age",
          "veh_fuel","veh_type"
          ,"veh_use" ,"geo_region_fr"
          ,"geo_postcode_lat","geo_postcode_lng"   
 )
 
+
 # Interactions bivariées pour var signi
 
+#MAtrice de corrélation pour catégorielle ??
 cor_matrix <- cor(train_set[vars],use = "pairwise.complete.obs",method = "pearson")
 
 library(corrplot)
