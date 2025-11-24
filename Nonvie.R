@@ -190,7 +190,7 @@ vars_all= c("veh_years_claim_free", "veh_age",
             "veh_use", "geo_postcode_2digits",
             "geo_munty_fr","geo_province_fr",
             "geo_region_fr", "geo_postcode_lat",
-            "geo_postcode_lng " ,"admi_risk_year" )
+            "geo_postcode_lng " , "driv_y_add_flg")
 
 for (var in vars_all) {
   cat(var, ": length =", length(Cdata[[var]]), 
@@ -198,45 +198,25 @@ for (var in vars_all) {
       ", Unique values =", length(unique(Cdata[[var]])), "\n")
 }
 
-vars <- c( "veh_years_claim_free", "veh_age", 
-           "veh_power", "veh_value",
-           "veh_weight" , "cont_seniority"
-           ,"driv_m_age","driv_y_age",
-           "veh_fuel","veh_make", 
-           "veh_seats", "veh_type", 
-           "veh_use", "geo_postcode_2digits"
-)
-
-for (var in vars) {
-  cat(var, ": length =", length(Cdata[[var]]), 
-      ", NA count =", sum(is.na(Cdata[[var]])), 
-      ", Unique values =", length(unique(Cdata[[var]])), "\n")
-}
-
 
 #On va tester claim_nb_tpl_md //  admi_risk_exposure est dans l'offset
-#Je ne prends pas en compte de l'âge de l'autre conducteur, mais déjà si y en a 1
-
-
 form <- function(var_name, data) {
   v <- data[[var_name]]
   #Binaire to facteur
   if (is.numeric(v) && length(unique(v)) <= 2) {
     as.formula(
-      paste("claim_nb_tpl_md ~ factor(", var_name, ") + offset(offset_link)
-)")
+      paste0("claim_nb_tpl_md ~ factor(", var_name, ") + offset(offset_link)")
     )
   } 
   #continue to spline
   else if (is.numeric(v)) {
     as.formula(
-      paste("claim_nb_tpl_md ~ s(", var_name, ") + offset(offset_link
-)")
+      paste0("claim_nb_tpl_md ~ s(", var_name, ") + offset(offset_link)")
     )
   } else {
     # facteur
     as.formula(
-      paste("claim_nb_tpl_md ~", var_name, "+ offset(offset_link)")
+      paste0("claim_nb_tpl_md ~ ", var_name, " + offset(offset_link)")
     )
   }
 }
@@ -256,9 +236,6 @@ transfo<- function(var_name, data) {
   }
 }
 
-transfo_var <- sapply(vars_all, transfo, data = train_set)
-offset<-log(train_set$admi_risk_exposure)
-
 #intercept mean frequency, meanfrequency is consitent with expected
 #family=quasipoisson() ou nb()
 fit0<-gam(claim_nb_tpl_md~1, data=train_set, poisson(link = "log"), offset=offset_link,  method = "REML")
@@ -266,293 +243,352 @@ mean_frequency <- exp(coef(fit0))
 mean_frequency
 
 
-#Firt everything gam
-x<-as.formula(paste("claim_nb_tpl_md ~", paste(transfo_var, collapse = " + ")))
+#Firt: gam will all var
 
+
+transfo_var_all <- sapply(vars_all, transfo, data = train_set)
 fit_all <- gam(as.formula(paste("claim_nb_tpl_md ~", 
-                                paste(transfo_var, collapse = " + ")))
+                                paste(transfo_var_all, collapse = " + ")))
                ,family = poisson(link = "log"), data = train_set, 
                offset = offset, method = "REML")
 summary (fit_all)
 
-
-#veh_make + veh_use + veh_years_claim_free + veh_age
-# veh_value + cont_seniority + driv_m_age
- 
 #figure margin ?
 plot(fit_all, pages = 1, residuals = TRUE, all.terms = TRUE)
 
 
-#Second test variable + model on significativ one by one 
+#Second : only variable signicicant better than intercept
 
-
-pvalue_solo_test <- function(var_name, data = train_set) {
-  form<-form(var_name, data)
-  v<-data[[var_name]]
+pvalue_solo_test <- function(var, data = train_set) {
+  fit0 <- gam(claim_nb_tpl_md ~ 1 + offset(offset_link), 
+              family = poisson(link = "log"), 
+              data = data, method = "REML")  
+  f<-form(var, data)
+  v<-data[[var]]
   res <- tryCatch({
-    fit <- gam(form, family = poisson(link = "log"), data = data,  method = "REML")
-    s   <- summary(fit)
-    
-    # p-value principale
-    if (is.numeric(v) && length(unique(v)) > 2) {
-      # cas s(variable)
-      p_val <- s$s.pv[1]
-    } else {
-      # cas factor(..) ou variable catégorielle
-      tab <- s$p.table
-      if (nrow(tab) > 1) {
-        p_val <- tab[2, 4]  # p-value du 1er coef non-intercept
-      } else {
-        p_val <- NA
-      }
-    }
+    fit <- gam(f, family = poisson(link = "log"), data = data,  method = "REML")
+
+    lrt_test <- anova(fit0, fit, test = "Chisq")
+    p_val <- lrt_test$`Pr(>Chi)`[2]
     
     data.frame(
-      variable   = var_name,
+      variable   = var,
       p_value    = p_val,
-      significant_5pct = ifelse(!is.na(p_val) & p_val < 0.05, TRUE, FALSE),
-      error      = NA_character_
+      significant = p_val < 0.05
     )
   })
   return(res)
 }
-
+#Compare les varaibles meilleur que l'intercept à alpha 0,05, puis donne 
+#les variables si significatives qu'ils serviront de base pour les algo suivants
+#afin de limoter la force
 results <- do.call(rbind, lapply(vars_all, pvalue_solo_test))
 results
 
-vars_s<- subset(results, significant_5pct)$variable
+vars_s<- subset(results, significant)$variable
 vars_s
+#"veh_years_claim_free" "veh_age"  "veh_value" "veh_weight"           
+#"cont_seniority"       "driv_m_age" "driv_y_age" "veh_fuel"             
+#"veh_seats""veh_type"  "veh_use"             
+#"geo_postcode_2digits""geo_munty_fr"  "geo_province_fr"      
+#"geo_region_fr"  "geo_postcode_lat"     "geo_postcode_lng "   
 
-#"veh_years_claim_free" "veh_age"              "veh_value"           
-# "veh_weight"           "cont_seniority"       "driv_m_age"          
-# "veh_fuel"             "veh_type"             "veh_use"             
-# "geo_region_fr"        "geo_postcode_lat"     "geo_postcode_lng "   
+transfo_s<- sapply(vars_s, transfo, data = train_set)
 
-
-transfo_var_s <- sapply(vars_s, transfo, data = train_set)
-
-fit_s <- gam(as.formula(paste("claim_nb_tpl_md ~", 
-                              paste(transfo_var_s, collapse = " + ")))
-             ,family = poisson(link = "log"), data = train_set, 
-             offset = offset,  method = "REML")
-summary(fit_s)
-#Significativ : veh_fuelgasoil(0.05) + veh_usepersonal(0.001) +veh_years_claim_free(0.0001)
-#veh_value(0.05) + cont_seniority(0.0001) + driv_m_age (0.0001)+ veh_age (0.001)
-#New list of vars
-vars<- c("veh_years_claim_free", "veh_age",
-         "veh_value", "veh_weight"
-         ,"cont_seniority","driv_m_age",
-         "veh_fuel","veh_type"
-         ,"veh_use" ,"geo_region_fr"
-         ,"geo_postcode_lat","geo_postcode_lng"   
-)
+signi_model <- gam(as.formula(paste("claim_nb_tpl_md ~", 
+                                   paste(transfo_s, collapse = " + ")))
+                  ,family = poisson(link = "log"), data = train_set, 
+                  offset = offset_link,  method = "REML")
 
 
-# Third : Nested model
 
-vars<- c("veh_years_claim_free", "veh_make",
-         "veh_age","geo_postcode_2digits",
-         "veh_value", "veh_weight"
-         ,"cont_seniority","driv_m_age",
-         "veh_fuel","veh_type"
-         ,"veh_use" ,"geo_region_fr"
-         ,"geo_postcode_lat","geo_postcode_lng"   
-)
+# Third : Nested model to check the best one
 
 
-#Choose:"geo_postcode_2digits" "veh_make"             "veh_age"             
-#"cont_seniority"       "veh_value"            "driv_m_age"          
-#"veh_years_claim_free" "veh_seats"(No way)            "driv_y_age"          
-# "veh_fuel
 
-#Among : "veh_years_claim_free" "veh_age"              "veh_power"           
-#"veh_value"            "veh_weight"           "cont_seniority"      
-#"driv_m_age"           "driv_y_age"           "veh_fuel"            
-#"veh_make"             "veh_seats"            "veh_type"            
-#"veh_use"              "geo_postcode_2digits"
-
-offset<-log(train_set$admi_risk_exposure)
-compare_models <- function(base_model, v, data = train_set) {
-  +   base_formula_str <- paste(deparse(formula(base_model)), collapse = " ")
-  +   
-    +   new_formula_str <- paste0(base_formula_str, " + ", transfo(v, data))
-    +   new_formula <- as.formula(new_formula_str)
-    +   
-      +   new_model <- gam(new_formula, family = poisson(link = "log"), data = data, offset = offset_link, method = "REML")
-      +   
-        +   # Test de rapport de vraisemblance
-        +   lrtest <- anova(base_model, new_model, test = "Chisq")
-        +   
-          +   # AIC
-          +   aic_diff <- AIC(new_model) - AIC(base_model)
-          +   
-            +   list(
-              +     variable = v,  
-              +     new_model = new_model,
-              +     p_value = lrtest$`Pr(>Chi)`[2],
-              +     aic_change = aic_diff,
-              +     significant = lrtest$`Pr(>Chi)`[2] < 0.05
-              +   )
-          + }
-# Intercept model
-base_model <- fit0
-#New: s_vars
-#[1] ""              "geo_postcode_lng" wtf only that    "veh_type"            
-#[4] ""             ""           ""           
-#[7] "" ""       ""
-#[10] "veh_use"              "driv_m_age"           "veh_fuel"            
-#Choose:"" ""             ""             
-#""       ""            "driv_m_age"          
-#"" "veh_seats"(No way)            "driv_y_age"          
-# "veh_fuel
-#veh_weight in only 1 tech no the other
-vars<- c("veh_years_claim_free", "veh_make",
-         "veh_age","geo_postcode_2digits",
-         "veh_value","cont_seniority", "veh_weight"
-         ,"driv_m_age",
-         "veh_fuel","veh_type"
-         ,"veh_use" ,"geo_region_fr"
-         ,"geo_postcode_lat","geo_postcode_lng"   
-)
-
-
-# Interactions bivariées pour var signi
-
-#MAtrice de corrélation pour catégorielle ??
-cor_matrix <- cor(train_set[vars],use = "pairwise.complete.obs",method = "pearson")
-
-library(corrplot)
-
-# Créer une visualisation claire
-corrplot(cor_matrix, 
-         method = "color",
-         type = "upper",
-         order = "hclust",  
-         tl.cex = 0.8,      
-         tl.col = "black",
-         addCoef.col = "black",  
-         number.cex = 0.7,
-         title = "Matrice de corrélation de Pearson",
-         mar = c(0,0,1,0))
-
-upper.tri(cor_matrix)
-
-# Clustering pour identifier des groupes de variables corrélées
-hclust_cor <- hclust(as.dist(1 - abs(cor_matrix)))  # Distance = 1 - |correlation|
-
-# Visualiser le dendrogramme
-plot(hclust_cor, main = "Clustering des variables par corrélation",
-     xlab = "", sub = "")
-
-# Découper en groupes
-groups <- cutree(hclust_cor, k = 3)  # 3 groupes
-cat("\nGroupes de variables corrélées:\n")
-for(i in 1:3) {
-  cat("Groupe", i, ":", names(groups[groups == i]), "\n")
+cv_poisson<- function(form, data, folds) {
+  K <- length(folds)
+  dev <- numeric(K)
+  
+  for (k in seq_along(folds)) {
+    test_idx <- folds[[k]]
+    train_idx <- setdiff(seq_len(nrow(data)), test_idx)
+    
+    train_k <- data[train_idx, ]
+    test_k  <- data[test_idx, ]
+    
+    fit_k <- gam(
+      as.formula(form),
+      family   = poisson(link = "log"),
+      data     = train_k,
+      offset   = train_k$offset_link,
+      method   = "REML"
+    )
+    
+    mu_hat <- predict(fit_k, newdata = test_k, type = "response")
+    y      <- test_k$claim_nb_tpl_md
+    
+    dev[k] <- 2 * sum(
+      ifelse(y == 0, 0, y * log(y / mu_hat)) - (y - mu_hat)
+    )
+  }
+  
+  mean(dev)
 }
 
-interactions_to_test <- c(
-  "te(driv_m_age, veh_age)",           # Âge conducteur × âge véhicule
-  "te(veh_value, geo_region_fr)",      # Valeur véhicule × région
-  "ti(cont_seniority, driv_m_age)",    # Ancienneté × âge conducteur
-  "te(veh_power, driv_m_age)",         # Puissance × âge conducteur
-  "ti(veh_type, veh_fuel)"           # Type véhicule × carburant
+compare_models <- function(formu_base, v, data,folds,cv_base ) {
+
+   formu_new <- paste0(formu_base, "+", transfo(v, data))
+  cv_new <- cv_poisson(form = formu_new,  data = data, folds = folds )
   
+    gain_rel <- (cv_base - cv_new) / cv_base
+  
+  list(
+    variable = v,  
+    formu_new = formu_new,
+        gain_rel= gain_rel,
+    cv_new=cv_new
+      )
+}
+
+idx_top3 <- order(results$p_value)[1:3]
+base_var <- subset(results[idx_top3, ])$variable
+base_var
+#"cont_seniority" "driv_m_age" "geo_munty_fr"  
+
+set.seed(123)
+folds <- createFolds(train_set$claim_nb_tpl_md, k = 5, list = TRUE)
+
+transfo_base_nest<- sapply(base_var, transfo, data = train_set)
+formu_base_nest<-paste0("claim_nb_tpl_md ~",  paste(transfo_base, collapse = " + "))
+cv_base_nest <- cv_poisson(formu_base_nest, data = train_set,  folds)
+cv_base_nest
+
+nest_var <- base_var
+remain_vars <- vars_s[!vars_s %in% c("cont_seniority", "driv_m_age","geo_munty_fr")]
+
+
+for (var in sample(remain_vars)) {
+    result_nest <- compare_models(formu_base_nest,var, train_set_folds,cv_base_nest)
+    cat("Var : ", var, "\n",
+      "  gain_rel  = ", round(result_nest$gain_rel, 6), "\n"
+    )
+    #Gain de deviance sup à 1%
+    if (result_nest$gain_rel > 0.001) {
+    nest_var <- c(nest_var, var) 
+    formu_base_nest<- result_nest$formu_new
+    cv_base_nest <- result_nest$cv_new  
+    cat(" >>> Variable retenue : ", var, "\n")
+      } 
+}
+
+nest_var
+nested_model <- gam(formu_base_nest,family = poisson(link = "log"), data = train_set, 
+                     offset = offset_link,  method = "REML")
+
+
+
+# Fourth : CV with bivariate interraction 
+
+
+
+interactions_to_test <- c(
+  "ti(cont_seniority, driv_m_age)",
+  "ti(cont_seniority, veh_age)",
+  
+  "ti(driv_m_age, veh_age)",
+
+  "s(cont_seniority, by = geo_munty_fr)",
+  "s(veh_age , by = geo_munty_fr)",
+  "s(driv_m_age, by = geo_munty_fr)",
+  
+  "s(cont_seniority, by = veh_use)",
+  "s(veh_age , by = veh_use)",
+  "s(driv_m_age , by = veh_use)"
 )
 
 
-# Tester chaque interaction
-test_interaction <- function(base_formula, interaction_term, data = train_set) {
-  interaction_formula <- as.formula(paste(deparse(base_formula), "+", interaction_term))
-  interaction_model <- gam(interaction_formula, family = poisson(link = "log"), 
-                           data = data, offset = offset_link, method = "REML")
+test_interac_cv <- function(interac, form, data, folds,cv_base) {
   
-  base_model <- gam(base_formula, family = poisson(link = "log"), 
-                    data = data, offset = offset_link, method = "REML")
+  formu <- paste0(form, "+", interac)
   
-  lrtest <- anova(base_model, interaction_model, test = "Chisq")
+  cv_new <- cv_poisson(form = formu,  data = data, folds = folds )
+ 
+  gain_rel <- (cv_base - cv_new) / cv_base
   
-  list(
-    interaction = interaction_term,
-    p_value = lrtest$`Pr(>Chi)`[2],
-    aic_change = AIC(interaction_model) - AIC(base_model),
-    significant = lrtest$`Pr(>Chi)`[2] < 0.05
+   list(
+    interaction = interac,
+    formu=formu,
+    cv_new= cv_new,
+    gain_rel = gain_rel
   )
 }
 
-# Appliquer les tests d'interaction
-base_formula <- formula(current_model)  # Le modèle final de l'étape 1
+#Initia
+base_model  
+base_formula <- paste0(deparse(formula(base_model)), collapse = " ")
 
-for (interaction in interactions_to_test) {
-  result <- test_interaction(base_formula, interaction)
-  cat("Interaction", interaction, ": p =", result$p_value, 
-      ", AIC change =", result$aic_change, "\n")
+cv_base <- cv_poisson(base_formula, data = train_set,  folds)
+cv_base
+
+cv_results <- do.call(rbind,lapply(interactions_to_test,test_interac_cv,
+ base_formula,data= train_set,folds = folds )
+)
+
+interac_s<-c()
+
+for (interac in sample(interactions_to_test)) {
+  result_interac <- test_interac_cv(interac, base_formula,train_set, folds,cv_base )
+  cat("Interaction : ", interac, "\n",
+      "  Gain de deviance= ", result_interac$gain_rel, "\n"
+  )
+  #Only gains de deviance sup à 1%
+  if (result_interac$gain_rel > 0.001) {
+    interac_s <- c(interac_s, interac) 
+    base_formula <- result_interac$formu  
+    cat(" >>> Intéraction retenue : ", interac, "\n")
+  } 
 }
 
+base_formula <- paste0(deparse(formula(base_model)), collapse = " ")
+form_interac <- paste0(base_formula, "+", interac_s)
+interac_model <- gam(form,family = poisson(link = "log"), data = train_set, 
+                  offset = offset_link,  method = "REML")
 
-#Forth : Cross-Validation gam
 
 
-folds <- createFolds(train_set$claim_nb_tpl_md, k = 10, returnTrain = TRUE)
+# Fifth: CV with others Binomial negativ or quasipoisson 
 
-total_loss_cv_mean <- 0
-for(i in 1:10) {
-  train_indices <- folds[[i]]
-  train_fold <- train_set[train_indices, ]
-  test_fold <- train_set[-train_indices, ]
+
+
+check_overdispersion <- function(model) {
+  #pearson_residuals = (y_i - μ_i) / √(V(μ_i))
+  residual_df <- df.residual(model)
+  #pearson_chisq = Σ r_i² = Σ [(y_i - μ_i)² / μ_i]
+  #pearson_chisq ~ χ²(n - p)
+  pearson_chisq <- sum(residuals(model, type = "pearson")^2)
+  #dispersion = pearson_chisq / (n - p)
+  dispersion <- pearson_chisq / residual_df
+  p_value <- pchisq(pearson_chisq, residual_df, lower.tail = FALSE)
+  #H₀: dispersion = 1 (Poisson approprié)
+  #H₁: dispersion ≠ 1 (sur/sous-dispersion)
+  #p_value = P(χ²(n-p) > pearson_chisq)
+  return(list(dispersion = dispersion, p_value = p_value))
+}
+
+check_overdispersion(fit_all)
+check_overdispersion(nested_model)
+check_overdispersion(signi_model)
+check_overdispersion(interac_model)
+#Forte surdispersion
+
+cv_family <- function(form, data, folds, family) {
+  K <- length(folds)
+  dev <- numeric(K)
   
-  gam_model <- gam(Tot_claim ~ 
-                     s(admi_risk_exposure) + 
-                     s(veh_years_claim_free) +
-                     s(veh_age) +
-                     s(veh_power) +
-                     s(veh_value) +
-                     s(veh_weight) +
-                     s(cont_seniority) +
-                     s(driv_m_age) +
-                     factor(veh_fuel) +
-                     factor(veh_type) +
-                     factor(veh_use) +
-                     factor(geo_postcode_2digits),
-                   data = train_fold,
-                   family = poisson(link = "log"),
-                   method = "ML")
-  
-  cv_prediction <- predict(gam_model, newdata = test_fold, type = "response")
-  
-  total_loss_cv <- 0
-  for (i in length(cv_prediction)) {
-    loss <- 2*(test_fold$Tot_claim[i]*log(test_fold$tot_claim[i]/cv_prediction[i])-(test_fold$Tot_claim[i]-cv_prediction[i]))
-    total_loss_cv = total_loss_cv + loss
+  for (k in seq_along(folds)) {
+    test_idx <- folds[[k]]
+    train_idx <- setdiff(seq_len(nrow(data)), test_idx)
+    
+    train_k <- data[train_idx, ]
+    test_k  <- data[test_idx, ]
+    
+    fit_k <- gam(
+      as.formula(form),
+      family   = family,
+      data     = train_k,
+      offset   = train_k$offset_link,
+      method   = "REML"
+    )
+    
+    mu_hat <- predict(fit_k, newdata = test_k, type = "response")
+    y  <- test_k$claim_nb_tpl_md
+    
+    # Deviance classique
+    if (family$family == "poisson") {
+      dev[k] <- 2 * sum(ifelse(y == 0, 0, y * log(y / mu_hat)) - (y - mu_hat))
+    } else if (family$family == "quasipoisson") {
+      # Quasi Poisson  déviance
+      dev[k] <- 2 * sum(ifelse(y == 0, 0, y * log(y / mu_hat)) - (y - mu_hat))
+    } else if (family$family == "nb") {
+      # Déviance binomiale négative
+      theta <- fit_k$family$getTheta(TRUE)  # paramètre de dispersion
+      dev[k] <- 2 * sum(lgamma(y + theta) - lgamma(theta) - lgamma(y + 1) +
+      theta * log(theta) + y * log(mu_hat) -(theta + y) * log(theta + mu_hat)
+      )
+    }
   }
-  total_loss_cv = total_loss_cv/length(test_fold$Tot_claim)
-  total_loss_cv_mean <- total_loss_cv_mean + total_loss_cv
-} 
-
-
-
-results <- sapply(vars, test_variable)
-print(results)
-
-
-
-
-
-#Fifth : all the same as before but with binomial negativ
-
-
-#Validation on the training set & compute loss_function
-training_predictions <-predict(gam_model, newdata = train_set, type = "response")
-
-total_loss_training <- 0
-for (i in length(training_predictions)) {
-  loss <- 2*(train_set$Tot_claim[i]*log(train_set$tot_claim[i]/training_predictions[i])-(Cdata$Tot_claom[i]-training_predictions[i]))
-  total_loss_training = total_loss_training + loss
+  
+  mean(dev)
 }
-total_loss_training = total_loss_training/length(train_set$Tot_claim)
-total_loss_training
 
-#Validation on the validation set & compute loss_function
+# Fonction pour tester toutes les familles sur un modèle donné
+test_families_cv <- function(model_formula, model_name, data, folds) {
+  families <- list(
+    poisson = poisson(link = "log"),
+    quasipoisson = quasipoisson(link = "log"),
+    negbin = nb(link = "log")
+  )
+  
+  results <- list()
+  
+  for (fam in names(families)) {
+    cv_score <- cv_family(form = model_formula,data = data,
+      folds = folds,  family = families[[fam]]
+    )
+    
+    results[[fam]] <- data.frame(
+      model = model_name,
+      family = fam,
+      cv_deviance = cv_score,
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  do.call(rbind, results)
+}
+
+# All va modele
+formula_all <- paste0("claim_nb_tpl_md ~", paste(transfo_var_all, collapse = " + "))
+results_all <- test_families_cv(formula_all, "all_variables", train_set, folds)
+
+# Significative sup intercept
+formula_signi <- paste("claim_nb_tpl_md ~", paste(transfo_s, collapse = " + "))
+results_signi <- test_families_cv(formula_signi, "significant_vars", train_set, folds)
+
+# Nested modele
+results_nest <- test_families_cv(formu_base_nest, "base_vars", train_set, folds)
+
+# Interac modele
+results_inter <- test_families_cv(form_interac, "with_interactions", train_set, folds)
+
+# Combiner tous les résultats
+all_results <- rbind(results_all, results_signi, results_nest, results_inter)
+
+# Afficher les résultats triés par meilleure déviance
+all_results <- all_results[order(all_results$cv_deviance), ]
+print(all_results)
+
+# Visualisation comparative
+library(ggplot2)
+ggplot(all_results, aes(x = model, y = cv_deviance, fill = family)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Comparaison des familles par validation croisée",
+       x = "Modèle", y = "Déviance CV") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+AIC(m_pois)
+AIC(m_nb)
+pred_pois <- predict(m_pois, newdata = val_set, type="response")
+RMSE_pois <- sqrt(mean((val_set$claim_nb_tpl_md - pred)^2))
+pred_nb <- predict(m_nb, newdata = val_set, type="response")
+RMSE_nb <- sqrt(mean((val_set$claim_nb_tpl_md - pred)^2))
+
+
+# Terminal: Validation on the validation set & compute loss_function
+
+
 validation_predictions <- predict(gam_model, newdata = val_set, type = "response")
 validation_predictions
 
@@ -564,12 +600,6 @@ for (i in length(validation_predictions)) {
 total_loss_validation = total_loss_validation/length(validation_set$claim_nb_tpl_md)
 total_loss_validation
 
-AIC(m_pois)
-AIC(m_nb)
-pred_pois <- predict(m_pois, newdata = val_set, type="response")
-RMSE_pois <- sqrt(mean((val_set$claim_nb_tpl_md - pred)^2))
-pred_nb <- predict(m_nb, newdata = val_set, type="response")
-RMSE_nb <- sqrt(mean((val_set$claim_nb_tpl_md - pred)^2))
 
 ##################################################################################################################################
 #Random Forests
