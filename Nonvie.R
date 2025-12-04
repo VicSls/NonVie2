@@ -9,9 +9,12 @@ library("parallel")
 library("tidyr")
 library("plyr")
 library("plotrix")
+library("doParallel")
 
 #Prepare the data
 data<-ulb_data
+game_data =data$purpose
+
 data_clean <- data %>% filter(!is.na(claim_nb_tpl_md))
 data_clean <- data_clean %>% filter(!is.na(claim_nb_tpl_bi))
 
@@ -243,21 +246,23 @@ mean_frequency <- exp(coef(fit0))
 mean_frequency
 
 
-#Firt: gam will all var
+
+#First: gam will all var
+
 
 
 transfo_var_all <- sapply(vars_all, transfo, data = train_set)
-fit_all <- gam(as.formula(paste("claim_nb_tpl_md ~", 
+all_model <- gam(as.formula(paste("claim_nb_tpl_md ~", 
                                 paste(transfo_var_all, collapse = " + ")))
                ,family = poisson(link = "log"), data = train_set, 
                offset = offset, method = "REML")
-summary (fit_all)
+#figure ?
 
-#figure margin ?
-plot(fit_all, pages = 1, residuals = TRUE, all.terms = TRUE)
 
 
 #Second : only variable signicicant better than intercept
+
+
 
 pvalue_solo_test <- function(var, data = train_set) {
   fit0 <- gam(claim_nb_tpl_md ~ 1 + offset(offset_link), 
@@ -293,31 +298,25 @@ vars_s
 #"geo_postcode_2digits""geo_munty_fr"  "geo_province_fr"      
 #"geo_region_fr"  "geo_postcode_lat"     "geo_postcode_lng "   
 
-transfo_s<- sapply(vars_s, transfo, data = train_set)
-
-signi_model <- gam(as.formula(paste("claim_nb_tpl_md ~", 
-                                   paste(transfo_s, collapse = " + ")))
-                  ,family = poisson(link = "log"), data = train_set, 
-                  offset = offset_link,  method = "REML")
-
 
 
 # Third : Nested model to check the best one
 
 
 
-cv_poisson<- function(form, data, folds) {
+cv_poisson<- function(form, data, folds,n_cores = detectCores() - 1) {
   K <- length(folds)
-  dev <- numeric(K)
+  cl <- makeCluster(n_cores)
+  registerDoParallel(cl)
   
-  for (k in seq_along(folds)) {
+  dev <- foreach(k = seq_along(folds), .combine = c, .packages = "mgcv") %dopar% {
     test_idx <- folds[[k]]
     train_idx <- setdiff(seq_len(nrow(data)), test_idx)
     
     train_k <- data[train_idx, ]
     test_k  <- data[test_idx, ]
     
-    fit_k <- gam(
+    fit_k <- mgcv::gam(
       as.formula(form),
       family   = poisson(link = "log"),
       data     = train_k,
@@ -325,14 +324,18 @@ cv_poisson<- function(form, data, folds) {
       method   = "REML"
     )
     
-    mu_hat <- predict(fit_k, newdata = test_k, type = "response")
-    y      <- test_k$claim_nb_tpl_md
-    
-    dev[k] <- 2 * sum(
-      ifelse(y == 0, 0, y * log(y / mu_hat)) - (y - mu_hat)
-    )
+    û_i <- predict(fit_k, newdata = data[test_idx, ], type = "response")
+    y_i <-data$claim_nb_tpl_md[test_idx]
+#D = 2 × [log-vraisemblance(modèle saturé) - log-vraisemblance(votre modèle)]
+
+    2 * sum(
+      ifelse(y_i == 0, 0, y_i * log(y_i / û_i)) - (y_i - û_i)
+   #Si y_i = 0 : deviance_i = 2 × [0 - (0 - μ_i)] = 2 × μ_i
+    #Si y_i > 0 : deviance_i = 2 × [y_i × log(y_i / μ_i) - (y_i - μ_i)]
+       )
   }
   
+  stopCluster(cl)
   mean(dev)
 }
 
@@ -354,37 +357,51 @@ compare_models <- function(formu_base, v, data,folds,cv_base ) {
 idx_top3 <- order(results$p_value)[1:3]
 base_var <- subset(results[idx_top3, ])$variable
 base_var
-#"cont_seniority" "driv_m_age" "geo_munty_fr"  
+#"cont_seniority" "driv_m_age" "geo_munty_fr"
 
 set.seed(123)
 folds <- createFolds(train_set$claim_nb_tpl_md, k = 5, list = TRUE)
 
 transfo_base_nest<- sapply(base_var, transfo, data = train_set)
-formu_base_nest<-paste0("claim_nb_tpl_md ~",  paste(transfo_base, collapse = " + "))
+formu_base_nest<-paste0("claim_nb_tpl_md ~",  paste(transfo_base_nest, collapse = " + "))
 cv_base_nest <- cv_poisson(formu_base_nest, data = train_set,  folds)
 cv_base_nest
 
 nest_var <- base_var
+#choisir une base forte au lieu d'une barrière forte à estimer
 remain_vars <- vars_s[!vars_s %in% c("cont_seniority", "driv_m_age","geo_munty_fr")]
-
-
+ 
+set.seed(123)
 for (var in sample(remain_vars)) {
-    result_nest <- compare_models(formu_base_nest,var, train_set_folds,cv_base_nest)
+    result_nest <- compare_models(formu_base_nest,var,train_set, folds,cv_base_nest)
     cat("Var : ", var, "\n",
       "  gain_rel  = ", round(result_nest$gain_rel, 6), "\n"
     )
-    #Gain de deviance sup à 1%
-    if (result_nest$gain_rel > 0.001) {
+    if (result_nest$gain_rel > 0) {
     nest_var <- c(nest_var, var) 
     formu_base_nest<- result_nest$formu_new
     cv_base_nest <- result_nest$cv_new  
-    cat(" >>> Variable retenue : ", var, "\n")
+    cat("IN ","\n",
+        "--------------------------------------------------------------","\n")
+    }else{
+        cat("OUT","\n",
+            "--------------------------------------------------------------","\n")
       } 
 }
+#Attention aux limitations :
+#Forward stepwise peut mener à des optimums locaux
+#Pas de garantie d'obtenir le meilleur sous-ensemble de variables
+#Risque d'inclure des variables marginalement utiles
 
 nest_var
-nested_model <- gam(formu_base_nest,family = poisson(link = "log"), data = train_set, 
-                     offset = offset_link,  method = "REML")
+#"cont_seniority" "driv_m_age"     "geo_munty_fr"   "veh_fuel"      
+#"geo_region_fr"  "veh_type"       "veh_use"  
+transfo_nest<- sapply(nest_var, transfo, data = train_set)
+form_nest_pois<-paste0("claim_nb_tpl_md ~",  paste(transfo_nest, collapse = " + "))
+nested_pois <- gam(as.formula(form_nest_pois),family = poisson(link = "log"), 
+                    data = train_set, offset = offset_link,  method = "REML")
+#"claim_nb_tpl_md ~s(cont_seniority) + s(driv_m_age) + geo_munty_fr 
+#+ veh_fuel + geo_region_fr + veh_type + veh_use"
 
 
 
@@ -393,18 +410,41 @@ nested_model <- gam(formu_base_nest,family = poisson(link = "log"), data = train
 
 
 interactions_to_test <- c(
+  #Interaction complex non linéaire
+  
   "ti(cont_seniority, driv_m_age)",
-  "ti(cont_seniority, veh_age)",
   
-  "ti(driv_m_age, veh_age)",
+  #Interaction simple linéiare, sinon bug
+  
+  "cont_seniority:geo_munty_fr",
+  "driv_m_age:geo_munty_fr",
 
-  "s(cont_seniority, by = geo_munty_fr)",
-  "s(veh_age , by = geo_munty_fr)",
-  "s(driv_m_age, by = geo_munty_fr)",
+  "cont_seniority:geo_region_fr ",
+  "driv_m_age:geo_region_fr ",
+
+  "cont_seniority:veh_fuel",
+  "driv_m_age:veh_fuel",
+
+  "cont_seniority:veh_type",
+  "driv_m_age:veh_type",
   
-  "s(cont_seniority, by = veh_use)",
-  "s(veh_age , by = veh_use)",
-  "s(driv_m_age , by = veh_use)"
+  "cont_seniority:veh_use",
+  "driv_m_age:veh_use",
+
+    "geo_munty_fr:geo_region_fr ",
+  "geo_munty_fr:veh_fuel",
+  "geo_munty_fr:veh_use",
+  "geo_munty_fr:veh_type",
+  
+  "veh_use:veh_fuel",
+  "veh_use:veh_type",
+  "veh_use:geo_region_fr",
+  
+  "veh_type:geo_region_fr",
+  "veh_type:veh_fuel",
+  
+  "geo_region_fr:veh_fuel"
+  
 )
 
 
@@ -425,75 +465,88 @@ test_interac_cv <- function(interac, form, data, folds,cv_base) {
 }
 
 #Initia
-base_model  
-base_formula <- paste0(deparse(formula(base_model)), collapse = " ")
-
-cv_base <- cv_poisson(base_formula, data = train_set,  folds)
-cv_base
-
-cv_results <- do.call(rbind,lapply(interactions_to_test,test_interac_cv,
- base_formula,data= train_set,folds = folds )
-)
-
+base_formula <- form_nest_pois
+cv_base <-cv_base_nest
+#4485.29
+tot_ite<-as.numeric(length(interactions_to_test))
 interac_s<-c()
 
+set.seed(123)
 for (interac in sample(interactions_to_test)) {
-  result_interac <- test_interac_cv(interac, base_formula,train_set, folds,cv_base )
+  tot_ite<-tot_ite-1
   cat("Interaction : ", interac, "\n",
-      "  Gain de deviance= ", result_interac$gain_rel, "\n"
-  )
-  #Only gains de deviance sup à 1%
-  if (result_interac$gain_rel > 0.001) {
+      "Nombre de test restant",tot_ite,"\n")
+  result_interac <- test_interac_cv(interac, base_formula,train_set, folds,cv_base )
+    cat("  Gain de deviance= ", result_interac$gain_rel, "\n" )
+  if (result_interac$gain_rel > 0) {
     interac_s <- c(interac_s, interac) 
     base_formula <- result_interac$formu  
-    cat(" >>> Intéraction retenue : ", interac, "\n")
-  } 
+    cat(" IN", "\n",
+        "--------------------------------------------------------------","\n")
+  } else{
+    cat("OUT","\n",
+        "--------------------------------------------------------------","\n")
+  }
 }
 
-base_formula <- paste0(deparse(formula(base_model)), collapse = " ")
-form_interac <- paste0(base_formula, "+", interac_s)
-interac_model <- gam(form,family = poisson(link = "log"), data = train_set, 
+interac_s<-paste0(interac_s, collapse = " + ")
+#"veh_type:geo_region_fr + cont_seniority:geo_region_fr  + 
+#geo_region_fr:veh_fuel + driv_m_age:veh_type + veh_use:geo_region_fr 
+#+ geo_munty_fr:geo_region_fr  + veh_use:veh_type"
+
+form_interac_pois <- paste0(form_nest_pois, "+", interac_s)
+#méthode REML: restricted 
+interac_pois <- gam(as.formula(form_interac_pois),family = poisson(link = "log"), data = train_set, 
                   offset = offset_link,  method = "REML")
 
+#s(cont_seniority) + s(driv_m_age) + geo_postcode_2digits + 
+#veh_fuel + veh_type + veh_use + veh_type:geo_region_fr + 
+#  cont_seniority:geo_region_fr + geo_region_fr:veh_fuel + driv_m_age:veh_type + 
+ # veh_use:geo_region_fr + geo_munty_fr:geo_region_fr + veh_use:veh_type
 
-
-# Fifth: CV with others Binomial negativ or quasipoisson 
+# Fifth: CV with others Binomial negativ or quasipoisson
+#which law would suit better the data ? 
+#the least CV deviance will be used,to do a nested model
+#and interactions nested model
 
 
 
 check_overdispersion <- function(model) {
   #pearson_residuals = (y_i - μ_i) / √(V(μ_i))
   residual_df <- df.residual(model)
-  #pearson_chisq = Σ r_i² = Σ [(y_i - μ_i)² / μ_i]
-  #pearson_chisq ~ χ²(n - p)
+  
+  #pearson_chisq = Σ r_i² = Σ [(y_i - μ_i)² / μ_i] //pearson_chisq ~ χ²(n - p)
   pearson_chisq <- sum(residuals(model, type = "pearson")^2)
+  
   #dispersion = pearson_chisq / (n - p)
   dispersion <- pearson_chisq / residual_df
+  
   p_value <- pchisq(pearson_chisq, residual_df, lower.tail = FALSE)
-  #H₀: dispersion = 1 (Poisson approprié)
-  #H₁: dispersion ≠ 1 (sur/sous-dispersion)
+  #H0: dispersion = 1 (Poisson approprié)
+  #H1: dispersion ≠ 1 (sur/sous-dispersion)
   #p_value = P(χ²(n-p) > pearson_chisq)
   return(list(dispersion = dispersion, p_value = p_value))
 }
 
-check_overdispersion(fit_all)
-check_overdispersion(nested_model)
-check_overdispersion(signi_model)
-check_overdispersion(interac_model)
+check_overdispersion(nested_pois)
+check_overdispersion(interac_pois)
 #Forte surdispersion
 
-cv_family <- function(form, data, folds, family) {
+
+
+cv_family <- function(form, data, folds, family, n_cores = detectCores() - 1) {
   K <- length(folds)
-  dev <- numeric(K)
+  cl <- makeCluster(n_cores)
+  registerDoParallel(cl)
   
-  for (k in seq_along(folds)) {
+  dev <- foreach(k = seq_along(folds), .combine = c, .packages = "mgcv") %dopar% {
     test_idx <- folds[[k]]
     train_idx <- setdiff(seq_len(nrow(data)), test_idx)
     
     train_k <- data[train_idx, ]
     test_k  <- data[test_idx, ]
     
-    fit_k <- gam(
+    fit_k <- mgcv::gam(
       as.formula(form),
       family   = family,
       data     = train_k,
@@ -501,24 +554,25 @@ cv_family <- function(form, data, folds, family) {
       method   = "REML"
     )
     
-    mu_hat <- predict(fit_k, newdata = test_k, type = "response")
-    y  <- test_k$claim_nb_tpl_md
+    û_i <- predict(fit_k, newdata = test_k, type = "response")
+    y_i <- test_k$claim_nb_tpl_md
     
-    # Deviance classique
-    if (family$family == "poisson") {
-      dev[k] <- 2 * sum(ifelse(y == 0, 0, y * log(y / mu_hat)) - (y - mu_hat))
-    } else if (family$family == "quasipoisson") {
-      # Quasi Poisson  déviance
-      dev[k] <- 2 * sum(ifelse(y == 0, 0, y * log(y / mu_hat)) - (y - mu_hat))
-    } else if (family$family == "nb") {
-      # Déviance binomiale négative
-      theta <- fit_k$family$getTheta(TRUE)  # paramètre de dispersion
-      dev[k] <- 2 * sum(lgamma(y + theta) - lgamma(theta) - lgamma(y + 1) +
-      theta * log(theta) + y * log(mu_hat) -(theta + y) * log(theta + mu_hat)
-      )
-    }
-  }
+    if (family$family == "Negative Binomial"|| family$family == "negbin") {
+      # Récupération de dispersion  theta estimé sur l'échantillon d'entraînement
+      #proviens du gam dans le max de vraisemblance
+      theta <- fit_k$family$getTheta(TRUE) 
+      
+      term1 <- ifelse(y_i == 0, 0, y_i * log(y_i / û_i))
+      term2 <- (y_i + theta) * log((y_i + theta) / (û_i + theta))
+      2 * sum(term1 - term2)
+      
+    } else {
+      # Déviance Poisson &quasipoisson
+      2 * sum(ifelse(y_i == 0, 0, y_i * log(y_i / û_i)) - (y_i - û_i))
+    } 
   
+  }
+  stopCluster(cl)
   mean(dev)
 }
 
@@ -526,6 +580,7 @@ cv_family <- function(form, data, folds, family) {
 test_families_cv <- function(model_formula, model_name, data, folds) {
   families <- list(
     poisson = poisson(link = "log"),
+    #la dispersion estimer avec les résidus de pearson, et la quasivraisemblance
     quasipoisson = quasipoisson(link = "log"),
     negbin = nb(link = "log")
   )
@@ -536,6 +591,8 @@ test_families_cv <- function(model_formula, model_name, data, folds) {
     cv_score <- cv_family(form = model_formula,data = data,
       folds = folds,  family = families[[fam]]
     )
+    cat("Famille : ", fam, "\n",
+        "  Déviance ", cv_score, "\n"    )
     
     results[[fam]] <- data.frame(
       model = model_name,
@@ -548,26 +605,28 @@ test_families_cv <- function(model_formula, model_name, data, folds) {
   do.call(rbind, results)
 }
 
-# All va modele
-formula_all <- paste0("claim_nb_tpl_md ~", paste(transfo_var_all, collapse = " + "))
-results_all <- test_families_cv(formula_all, "all_variables", train_set, folds)
-
-# Significative sup intercept
-formula_signi <- paste("claim_nb_tpl_md ~", paste(transfo_s, collapse = " + "))
-results_signi <- test_families_cv(formula_signi, "significant_vars", train_set, folds)
 
 # Nested modele
-results_nest <- test_families_cv(formu_base_nest, "base_vars", train_set, folds)
+results_nest_pois <- test_families_cv(form_nest_pois, "base_vars", train_set, folds)
+#"claim_nb_tpl_md ~s(cont_seniority) + s(driv_m_age) + geo_postcode_2digits 
+#+ veh_fuel + veh_type + veh_use"
+#model       family cv_deviance
+#poisson      base_vars      poisson    7482.517
+#quasipoisson base_vars quasipoisson    7481.319
+#negbin       base_vars       negbin    7482.518
 
 # Interac modele
-results_inter <- test_families_cv(form_interac, "with_interactions", train_set, folds)
+results_inter_pois <- test_families_cv(form_interac_pois, "with_interactions", train_set, folds)
+#Famille :  poisson 
+#Déviance  7482.672 
+#Famille :  quasipoisson 
+#Déviance  7483.096 
+#Famille :  negbin 
+#Déviance  7486.032 
 
 # Combiner tous les résultats
-all_results <- rbind(results_all, results_signi, results_nest, results_inter)
+all_results <- rbind(results_nest_pois, results_inter_pois)
 
-# Afficher les résultats triés par meilleure déviance
-all_results <- all_results[order(all_results$cv_deviance), ]
-print(all_results)
 
 # Visualisation comparative
 library(ggplot2)
@@ -578,27 +637,158 @@ ggplot(all_results, aes(x = model, y = cv_deviance, fill = family)) +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-AIC(m_pois)
-AIC(m_nb)
-pred_pois <- predict(m_pois, newdata = val_set, type="response")
-RMSE_pois <- sqrt(mean((val_set$claim_nb_tpl_md - pred)^2))
-pred_nb <- predict(m_nb, newdata = val_set, type="response")
-RMSE_nb <- sqrt(mean((val_set$claim_nb_tpl_md - pred)^2))
 
 
 # Terminal: Validation on the validation set & compute loss_function
 
 
-validation_predictions <- predict(gam_model, newdata = val_set, type = "response")
-validation_predictions
 
-total_loss_validation <- 0
-for (i in length(validation_predictions)) {
-  loss <- 2*(val_set$Tot_claim[i]*log(val_set$Tot_claim[i]/validation_predictions[i])-(Val_set$Tot_claim[i]-validation_predictions[i]))
-  total_loss_validation = total_loss_validation + loss
+evaluate_model <- function(model, val_set, model_name) {
+  
+  # Prédictions val set
+  predic_val  <- predict(model, newdata = val_set, type = "response")
+  y_val  <- val_set$claim_nb_tpl_md
+  
+  # % d'amélioration par rapport intercept
+  dev_train <- model$deviance
+  null_deviance <- model$null.deviance
+  deviance_explained <- (null_deviance - dev_train) / null_deviance
+  
+  # Les résidus de DEVIANCE sont plus utiles pour :
+  # - Diagnostic de l'ajustement du modèle
+  # - Vérification des hypothèses de distribution
+  # - Ils suivent approximativement une distribution normale si le modèle est correct
+  deviance_residuals <- residuals(model, type = "deviance")
+  
+  # Les résidus de PEARSON sont plus utiles pour :
+  # - Détection de la surdispersion
+  # - Tests d'adéquation (chi²)
+  # - Points influents
+  pearson_residuals <- residuals(model, type = "pearson")
+  
+    # Déviance sur validation : généralisation du modèle
+  #  Si ≫ déviance entraînement : overfitting
+  #  Si ∼ déviance entraînement : bon équilibre
+    #bonne déviance même avec binomial négative ? Loss fonction?
+   if (model$family$family == "Negative Binomial") {
+    theta <- model$family$getTheta(TRUE)
+      term1 <- ifelse(y_val == 0, 0, y_val * log(y_val / predic_val))
+    term2 <- (y_val + theta) * log((y_val + theta) / (predic_val + theta))
+    dev_val<- 2 * sum(term1 - term2)
+    
+  } else {
+    # Déviance Poisson & quasipoisson
+    2 * sum(ifelse(y_val == 0, 0, y_val * log(y_val / predic_val)) - (y_val - predic_val))
+  } 
+  
+  #mesure d'erreur
+  mse <- mean((y_val - predic_val)^2)
+  #mesure de modèle
+  aic_value<-AIC(model)
+
+  # Intervalle de confiance sur l'échelle linéaire
+  pred_IC <- predict(model, newdata = val_set,
+                          type = "link", se.fit = TRUE)
+  # Transformation vers l'échelle de réponse
+    lower_IC <- exp(pred_IC$fit - 1.96 * pred_IC$se.fit)
+  upper_IC <- exp(pred_IC$fit + 1.96 * pred_IC$se.fit)
+  #Idéalement ~95% si le modèle est bien calibré
+  coverage <- mean(y_val >= lower_IC & y_val <= upper_IC) * 100
+  
+  # H0: Le modèle est bien adapté aux données
+  # p-value > 0.05 : pas de preuve contre H0 → modèle adéquat
+  # p-value < 0.05 : modèle potentiellement mal adapté
+  chi2_stat <- sum(pearson_residuals^2)
+  chi2_pvalue <- pchisq(chi2_stat, df.residual(model), lower.tail = FALSE)
+  
+  return(list(
+    model_name = model_name,
+    dev_train = dev_train,
+    dev_explained = deviance_explained,
+    dev_val = dev_val,
+    aic = aic_value,
+    mse = mse,
+    coverage_ci = coverage,
+    chi2_pvalue = chi2_pvalue,
+    deviance_resid_summary = summary(deviance_residuals),
+    pearson_resid_summary = summary(pearson_residuals)
+  ))
 }
-total_loss_validation = total_loss_validation/length(validation_set$claim_nb_tpl_md)
-total_loss_validation
+
+# Évaluation de tous les modèles
+models_to_evaluate <- list()
+
+models_to_evaluate[["nested_poisson"]] <- nested_model
+models_to_evaluate[["interac_poisson"]] <- interac_model
+
+models_to_evaluate[["nested_nb"]] <- nested_nb
+models_to_evaluate[["interac_nb"]] <- interac_nb
+
+models_to_evaluate[["nested_quasi"]] <- nested_quasi
+models_to_evaluate[["interac_quasi"]] <- interac_quasi
+
+# Évaluation complète sur le jeu de validation
+results_validation <- list()
+
+for (model_name in names(models_to_evaluate)) {
+  cat("Évaluation du modèle:", model_name, "\n")
+  results_validation[[model_name]] <- evaluate_model(
+    models_to_evaluate[[model_name]], 
+    val_set, 
+    model_name
+  )
+}
+
+# Création d'un tableau comparatif
+comparison_table <- do.call(rbind, lapply(results_validation, function(x) {
+  data.frame(
+    Modèle = x$model_name,
+    Déviance = x$deviance,
+    Déviance_Expliquée = round(x$deviance_explained * 100, 2),
+    Déviance_Validation = x$deviance_validation,
+    AIC = round(x$aic, 1),
+    Dispersion = round(x$dispersion, 3),
+    P_value_Dispersion = ifelse(x$dispersion_pvalue < 0.001, "<0.001", 
+                                round(x$dispersion_pvalue, 3)),
+    MSE = round(x$mse, 4),
+    MAE = round(x$mae, 4),
+    Couverture_IC = round(x$coverage_ci, 1),
+    P_value_Chi2 = ifelse(x$chi2_pvalue < 0.001, "<0.001", 
+                          round(x$chi2_pvalue, 3)),
+    stringsAsFactors = FALSE
+  )
+}))
+
+comparison_table <- comparison_table[order(comparison_table$Déviance), ]
+
+# Affichage des résultats
+print(comparison_table)
+
+
+
+par(mfrow = c(1, 2))
+plot(fitted(model), residus_deviance, main = "Résidus Deviance")
+abline(h = 0, col = "red")
+plot(fitted(model), residus_pearson, main = "Résidus Pearson")
+abline(h = 0, col = "red")
+
+# Visualisation des résidus
+par(mfrow = c(2, 2))
+for (i in 1:min(4, length(models_to_evaluate))) {
+  model_name <- names(models_to_evaluate)[i]
+  model <- models_to_evaluate[[model_name]]
+  
+  # Résidus de déviance
+  plot(fitted(model), residuals(model, type = "deviance"),
+       main = paste("Résidus déviance -", model_name),
+       xlab = "Valeurs prédites", ylab = "Résidus")
+  abline(h = 0, col = "red")
+  
+  # QQ plot des résidus
+  qqnorm(residuals(model, type = "deviance"), 
+         main = paste("QQ Plot -", model_name))
+  qqline(residuals(model, type = "deviance"), col = "red")
+}
 
 
 ##################################################################################################################################
