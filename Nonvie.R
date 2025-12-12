@@ -394,15 +394,13 @@ for (var in sample(remain_vars)) {
 #Risque d'inclure des variables marginalement utiles
 
 nest_var
-#"cont_seniority" "driv_m_age"     "geo_munty_fr"   "veh_fuel"      
-#"geo_region_fr"  "veh_type"       "veh_use"  
+#nest_var<-c("cont_seniority", "driv_m_age","geo_munty_fr","veh_fuel","geo_region_fr", "veh_type", "veh_use")
 transfo_nest<- sapply(nest_var, transfo, data = train_set)
 form_nest_pois<-paste0("claim_nb_tpl_md ~",  paste(transfo_nest, collapse = " + "))
 nested_pois <- gam(as.formula(form_nest_pois),family = poisson(link = "log"), 
                     data = train_set, offset = offset_link,  method = "REML")
 #"claim_nb_tpl_md ~s(cont_seniority) + s(driv_m_age) + geo_munty_fr 
 #+ veh_fuel + geo_region_fr + veh_type + veh_use"
-
 
 
 # Fourth : CV with bivariate interraction 
@@ -490,24 +488,18 @@ for (interac in sample(interactions_to_test)) {
 }
 
 interac_s<-paste0(interac_s, collapse = " + ")
-#"veh_type:geo_region_fr + cont_seniority:geo_region_fr  + 
-#geo_region_fr:veh_fuel + driv_m_age:veh_type + veh_use:geo_region_fr 
-#+ geo_munty_fr:geo_region_fr  + veh_use:veh_type"
+#interac_s<-"veh_type:geo_region_fr + cont_seniority:geo_region_fr  + geo_region_fr:veh_fuel + driv_m_age:veh_type + veh_use:geo_region_fr + geo_munty_fr:geo_region_fr  + veh_use:veh_type"
 
 form_interac_pois <- paste0(form_nest_pois, "+", interac_s)
-#méthode REML: restricted 
+#form_interac_pois<-"claim_nb_tpl_md ~s(cont_seniority) + s(driv_m_age) + geo_munty_fr + veh_fuel + geo_region_fr + veh_type + veh_use+veh_type:geo_region_fr + cont_seniority:geo_region_fr  + geo_region_fr:veh_fuel + driv_m_age:veh_type + veh_use:geo_region_fr + geo_munty_fr:geo_region_fr  + veh_use:veh_type"
+#méthode REML: restricted !
 interac_pois <- gam(as.formula(form_interac_pois),family = poisson(link = "log"), data = train_set, 
                   offset = offset_link,  method = "REML")
 
-#s(cont_seniority) + s(driv_m_age) + geo_postcode_2digits + 
-#veh_fuel + veh_type + veh_use + veh_type:geo_region_fr + 
-#  cont_seniority:geo_region_fr + geo_region_fr:veh_fuel + driv_m_age:veh_type + 
- # veh_use:geo_region_fr + geo_munty_fr:geo_region_fr + veh_use:veh_type
 
 # Fifth: CV with others Binomial negativ or quasipoisson
 #which law would suit better the data ? 
-#the least CV deviance will be used,to do a nested model
-#and interactions nested model
+
 
 
 
@@ -533,111 +525,30 @@ check_overdispersion(interac_pois)
 #Forte surdispersion
 
 
+#Pas restester nested and interac test avec negbin et quasipoisson acr prend trop de temps
 
-cv_family <- function(form, data, folds, family, n_cores = detectCores() - 1) {
-  K <- length(folds)
-  cl <- makeCluster(n_cores)
-  registerDoParallel(cl)
-  
-  dev <- foreach(k = seq_along(folds), .combine = c, .packages = "mgcv") %dopar% {
-    test_idx <- folds[[k]]
-    train_idx <- setdiff(seq_len(nrow(data)), test_idx)
-    
-    train_k <- data[train_idx, ]
-    test_k  <- data[test_idx, ]
-    
-    fit_k <- mgcv::gam(
-      as.formula(form),
-      family   = family,
-      data     = train_k,
-      offset   = train_k$offset_link,
-      method   = "REML"
-    )
-    
-    û_i <- predict(fit_k, newdata = test_k, type = "response")
-    y_i <- test_k$claim_nb_tpl_md
-    
-    if (family$family == "Negative Binomial"|| family$family == "negbin") {
-      # Récupération de dispersion  theta estimé sur l'échantillon d'entraînement
-      #proviens du gam dans le max de vraisemblance
-      theta <- fit_k$family$getTheta(TRUE) 
-      
-      term1 <- ifelse(y_i == 0, 0, y_i * log(y_i / û_i))
-      term2 <- (y_i + theta) * log((y_i + theta) / (û_i + theta))
-      2 * sum(term1 - term2)
-      
-    } else {
-      # Déviance Poisson &quasipoisson
-      2 * sum(ifelse(y_i == 0, 0, y_i * log(y_i / û_i)) - (y_i - û_i))
-    } 
-  
-  }
-  stopCluster(cl)
-  mean(dev)
-}
+nested_nb <- gam(as.formula(form_nest_pois),family = nb(link = "log"), 
+                     data = train_set, offset = offset_link,method = "REML")
+theta_nested<-nested_nb$family$getTheta(TRUE)
+#Theta->10991.57, suggère pas de surdispersion 
 
-# Fonction pour tester toutes les familles sur un modèle donné
-test_families_cv <- function(model_formula, model_name, data, folds) {
-  families <- list(
-    poisson = poisson(link = "log"),
-    #la dispersion estimer avec les résidus de pearson, et la quasivraisemblance
-    quasipoisson = quasipoisson(link = "log"),
-    negbin = nb(link = "log")
-  )
-  
-  results <- list()
-  
-  for (fam in names(families)) {
-    cv_score <- cv_family(form = model_formula,data = data,
-      folds = folds,  family = families[[fam]]
-    )
-    cat("Famille : ", fam, "\n",
-        "  Déviance ", cv_score, "\n"    )
-    
-    results[[fam]] <- data.frame(
-      model = model_name,
-      family = fam,
-      cv_deviance = cv_score,
-      stringsAsFactors = FALSE
-    )
-  }
-  
-  do.call(rbind, results)
-}
+interac_nb <- gam(as.formula(form_interac_pois),family = nb(link = "log"), 
+                      data = train_set, offset = offset_link, method = "REML")
+theta_interac <- interac_nb$family$getTheta(TRUE)
 
+# Modèles quasi-Poisson
+nested_quasi <- gam(as.formula(form_nest_pois),family = quasipoisson(link = "log"), 
+                           data = train_set,offset = offset_link,method = "REML")
 
-# Nested modele
-results_nest_pois <- test_families_cv(form_nest_pois, "base_vars", train_set, folds)
-#"claim_nb_tpl_md ~s(cont_seniority) + s(driv_m_age) + geo_postcode_2digits 
-#+ veh_fuel + veh_type + veh_use"
-#model       family cv_deviance
-#poisson      base_vars      poisson    7482.517
-#quasipoisson base_vars quasipoisson    7481.319
-#negbin       base_vars       negbin    7482.518
+interac_quasi <- gam(as.formula(form_interac_pois),family = quasipoisson(link = "log"), 
+                            data = train_set, offset = offset_link,   method = "REML")
 
-# Interac modele
-results_inter_pois <- test_families_cv(form_interac_pois, "with_interactions", train_set, folds)
-#Famille :  poisson 
-#Déviance  7482.672 
-#Famille :  quasipoisson 
-#Déviance  7483.096 
-#Famille :  negbin 
-#Déviance  7486.032 
-
-# Combiner tous les résultats
-all_results <- rbind(results_nest_pois, results_inter_pois)
-
-
-# Visualisation comparative
-library(ggplot2)
-ggplot(all_results, aes(x = model, y = cv_deviance, fill = family)) +
-  geom_bar(stat = "identity", position = "dodge") +
-  labs(title = "Comparaison des familles par validation croisée",
-       x = "Modèle", y = "Déviance CV") +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-
+phi_nested <- summary(nested_quasi)$dispersion
+phi_interac <- summary(interac_quasi)$dispersion
+install.packages("AER")
+library("AER")
+dispersiontest(nested_pois)
+dispersiontest(nested_pois)
 
 # Terminal: Validation on the validation set & compute loss_function
 
@@ -671,14 +582,13 @@ evaluate_model <- function(model, val_set, model_name) {
   #  Si ∼ déviance entraînement : bon équilibre
     #bonne déviance même avec binomial négative ? Loss fonction?
    if (model$family$family == "Negative Binomial") {
-    theta <- model$family$getTheta(TRUE)
       term1 <- ifelse(y_val == 0, 0, y_val * log(y_val / predic_val))
     term2 <- (y_val + theta) * log((y_val + theta) / (predic_val + theta))
     dev_val<- 2 * sum(term1 - term2)
     
   } else {
     # Déviance Poisson & quasipoisson
-    2 * sum(ifelse(y_val == 0, 0, y_val * log(y_val / predic_val)) - (y_val - predic_val))
+    dev_val<-2 * sum(ifelse(y_val == 0, 0, y_val * log(y_val / predic_val)) - (y_val - predic_val))
   } 
   
   #mesure d'erreur
@@ -718,8 +628,8 @@ evaluate_model <- function(model, val_set, model_name) {
 # Évaluation de tous les modèles
 models_to_evaluate <- list()
 
-models_to_evaluate[["nested_poisson"]] <- nested_model
-models_to_evaluate[["interac_poisson"]] <- interac_model
+models_to_evaluate[["nested_pois"]] <- nested_pois
+models_to_evaluate[["interac_pois"]] <- interac_pois
 
 models_to_evaluate[["nested_nb"]] <- nested_nb
 models_to_evaluate[["interac_nb"]] <- interac_nb
@@ -738,58 +648,160 @@ for (model_name in names(models_to_evaluate)) {
     model_name
   )
 }
+r<-as.data.frame(do.call(rbind, results_validation))
 
-# Création d'un tableau comparatif
-comparison_table <- do.call(rbind, lapply(results_validation, function(x) {
-  data.frame(
-    Modèle = x$model_name,
-    Déviance = x$deviance,
-    Déviance_Expliquée = round(x$deviance_explained * 100, 2),
-    Déviance_Validation = x$deviance_validation,
-    AIC = round(x$aic, 1),
-    Dispersion = round(x$dispersion, 3),
-    P_value_Dispersion = ifelse(x$dispersion_pvalue < 0.001, "<0.001", 
-                                round(x$dispersion_pvalue, 3)),
-    MSE = round(x$mse, 4),
-    MAE = round(x$mae, 4),
-    Couverture_IC = round(x$coverage_ci, 1),
-    P_value_Chi2 = ifelse(x$chi2_pvalue < 0.001, "<0.001", 
-                          round(x$chi2_pvalue, 3)),
-    stringsAsFactors = FALSE
-  )
-}))
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(tidyr)
 
-comparison_table <- comparison_table[order(comparison_table$Déviance), ]
-
-# Affichage des résultats
-print(comparison_table)
-
-
-
-par(mfrow = c(1, 2))
-plot(fitted(model), residus_deviance, main = "Résidus Deviance")
-abline(h = 0, col = "red")
-plot(fitted(model), residus_pearson, main = "Résidus Pearson")
-abline(h = 0, col = "red")
-
-# Visualisation des résidus
-par(mfrow = c(2, 2))
-for (i in 1:min(4, length(models_to_evaluate))) {
-  model_name <- names(models_to_evaluate)[i]
-  model <- models_to_evaluate[[model_name]]
+# Créer un dataframe propre à partir des résultats
+create_results_df <- function(results_validation) {
+  # Extraire les métriques principales
+  main_metrics <- do.call(rbind, lapply(results_validation, function(x) {
+    data.frame(
+      model = x$model_name,
+      dev_explained = x$dev_explained * 100,  # Convertir en pourcentage
+      dev_val = x$dev_val,
+      coverage = x$coverage_ci,
+      chi2_pvalue = x$chi2_pvalue,
+      stringsAsFactors = FALSE
+    )
+  }))
   
-  # Résidus de déviance
-  plot(fitted(model), residuals(model, type = "deviance"),
-       main = paste("Résidus déviance -", model_name),
-       xlab = "Valeurs prédites", ylab = "Résidus")
-  abline(h = 0, col = "red")
+  # Extraire les résidus de Pearson (summary -> valeurs)
+  deviance_resid <- do.call(rbind, lapply(names(results_validation), function(model_name) {
+    x <- results_validation[[model_name]]
+    if(!is.null(x$deviance_resid_summary)) {
+      resid_values <- as.numeric(unlist(strsplit(
+        gsub("[^0-9.,-]+", "", x$deviance_resid_summary), 
+        split = ",")))
+      data.frame(
+        model = model_name,
+        resid_type = "Deviance",
+        min = resid_values[1],
+        q1 = resid_values[2],
+        median = resid_values[3],
+        q3 = resid_values[4],
+        max = resid_values[5]
+      )
+    } else {
+      NULL
+    }
+  }))
   
-  # QQ plot des résidus
-  qqnorm(residuals(model, type = "deviance"), 
-         main = paste("QQ Plot -", model_name))
-  qqline(residuals(model, type = "deviance"), col = "red")
+  list(main_metrics = main_metrics, deviance_resid = deviance_resid)
 }
 
+# Préparer les données
+results_data <- create_results_df(results_validation)
+main_df <- results_data$main_metrics
+deviance_df <- results_data$deviance_resid
+
+# Palette de couleurs cohérente
+model_colors <- c(
+  "nested_pois" = "#1f77b4",
+  "interac_pois" = "#ff7f0e", 
+  "nested_nb" = "#2ca02c",
+  "interac_nb" = "#d62728",
+  "nested_quasi" = "#9467bd",
+  "interac_quasi" = "#8c564b"
+)
+plot_dev_explained <- ggplot(main_df, 
+                             aes(x = reorder(model, dev_explained), 
+                                 y = dev_explained,
+                                 fill = model)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(aes(label = sprintf("%.3f%%", dev_explained)),
+            vjust = -0.5, size = 4, fontface = "bold") +
+  scale_fill_manual(values = model_colors) +
+  labs(
+    title = "Déviance expliquée par le modèle",
+    subtitle = "Pourcentage de déviance nulle expliquée\n(plus élevé = mieux)",
+    x = "Modèle",
+    y = "Déviance expliquée (%)",
+    fill = "Modèle"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    legend.position = "none",
+    panel.grid.major.x = element_blank()
+  ) +
+  ylim(0, max(main_df$dev_explained) * 1.15)
+
+print(plot_dev_explained)
+
+plot_dev_val <- ggplot(main_df, 
+                       aes(x = reorder(model, dev_val), 
+                           y = dev_val,
+                           fill = model)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(aes(label = format(round(dev_val, 1), big.mark = ",")),
+            vjust = -0.5, size = 4, fontface = "bold") +
+  scale_fill_manual(values = model_colors) +
+  labs(
+    title = "Déviance Poisson sur l'ensemble de validation",
+    subtitle = "Mesure de l'erreur de prédiction\n(plus bas = mieux)",
+    x = "Modèle",
+    y = "Déviance",
+    fill = "Modèle"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    legend.position = "none",
+    panel.grid.major.x = element_blank()
+  ) +
+  ylim(0, max(main_df$dev_val) * 1.1)
+
+print(plot_dev_val)
+
+plot_coverage <- ggplot(main_df, 
+                        aes(x = reorder(model, coverage), 
+                            y = coverage,
+                            fill = model)) +
+  geom_bar(stat = "identity", width = 0.7, alpha = 0.8) +
+  geom_text(aes(label = sprintf("%.1f%%", coverage)),
+            vjust = -0.5, size = 4, fontface = "bold") +
+  geom_hline(yintercept = 95, 
+             linetype = "dashed", 
+             color = "red", 
+             size = 1.2,
+             alpha = 0.7) +
+  annotate("text", 
+           x = 6, 
+           y = 100, 
+           label = "Valeur cible: 95%",
+           color = "red",
+           fontface = "bold",
+           size = 4) +
+  scale_fill_manual(values = model_colors) +
+  labs(
+    title = "Coverage des intervalles de confiance à 95%",
+    subtitle = "Pourcentage des observations dans l'IC de prédiction\n(Idéalement ~95%)",
+    x = "Modèle",
+    y = "Coverage (%)",
+    fill = "Modèle"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    legend.position = "none"
+  ) +
+  ylim(0, 105)
+
+print(plot_coverage)
+#Manque bcp de chose poour graphh up 
 
 ##################################################################################################################################
 #Random Forests
@@ -857,3 +869,450 @@ res = foreach(i =1:nrow(grid.param)) %dopar% {
             nodesize = grid.param[i,]$nodesize., # Current nodesize
             keep.forest = TRUE)
 }
+
+
+
+##################################################################################""
+# NN
+
+library(neuralnet)
+library(caret)
+
+
+# Pour un réseau de neurones, nous devons:
+# 1. Gérer les variables continues (standardisation)
+# 2. Gérer les variables catégorielles (encodage)
+
+
+data_nn <- function(data, vars,target = "claim_nb_tpl_md") {
+  
+  df <- data[, c(target,"offset_link", vars,"admi_risk_exposure")]
+  continuous_vars <- c()
+  categorical_vars <- c()
+  # Standardiser toutes les variables continues
+  # Standardisation des variables continues (Z-score normalization)
+  # FORMULE: (x - mean(x)) / sd(x)
+  # POURQUOI? Pour que toutes les variables aient une échelle similaire
+  # Cela aide la convergence lors de l'entraînement
+  for(var in c(vars)) {
+    if(is.numeric(df[[var]]) && length(unique(df[[var]])) > 10) {
+      continuous_vars <- c(continuous_vars, var)
+            df[[var]] <- as.numeric(scale(df[[var]]))
+    }else{
+      categorical_vars <- c(categorical_vars, var)
+            df[[var]] <- as.factor(df[[var]])
+    }  }
+
+    # Convertir les facteurs en variables dummy
+  #Crée des dummies pour les variables catégorielles (automatiquement)
+  
+  formula <- as.formula(paste("~", paste(categorical_vars, collapse = " + ")))
+  mm <- model.matrix(formula, data = df)
+  mm <- mm[, -1, drop = FALSE]
+
+  cont_data <- as.matrix(df[, continuous_vars, drop = FALSE])
+  final_data <- cbind(cont_data, mm)
+  
+  final_df <- as.data.frame(final_data)
+  final_df$target <- df[[target]]
+  final_df$exposure    <- pmax(df[["admi_risk_exposure"]], 1e-10)
+  final_df$freq        <- final_df$target / final_df$exposure
+  final_df$logexposure<-df[["offset_link"]]
+
+  return(final_df)
+  }
+
+# Sélectionner un sous-ensemble de variables importantes
+#Ajouter celle de RF // gbm ?
+important_vars <- c("cont_seniority", "driv_m_age", "geo_munty_fr", 
+                    "veh_fuel", "geo_region_fr", "veh_type", "veh_use")
+
+Cdata_nn<-data_nn(Cdata,important_vars)
+train_nn <- Cdata_nn[train_index, ]
+val_nn <- Cdata_nn[-train_index, ]
+
+#Test
+target_train_original <- train_set$claim_nb_tpl_md 
+target_val_original <- val_set$claim_nb_tpl_md
+
+target_train_nn <- train_nn[, "target"]
+target_val_nn <- val_nn[, "target"]
+
+diff_train <- target_train_original - target_train_nn
+diff_val <- target_val_original - target_val_nn
+sum(diff_train)
+sum(diff_val)
+for (var in names(train_nn)) {
+  cat(var, ": length =", length(train_nn[[var]]), 
+      ", NA count =", sum(is.na(train_nn[[var]])), 
+      ", Unique values =", length(unique(train_nn[[var]])),"\n")
+}
+for (var in names(train_nn)) {
+  vals <- train_nn[[var]]
+  
+  cat(
+    var, ":",
+    "length =", length(vals),
+    ", NA count =", sum(is.na(vals)),
+    ", Infinite count =", sum(is.infinite(vals)),
+    ", NaN count =", sum(is.nan(vals)),
+    ", Non-finite total =", sum(!is.finite(vals)),
+    ", Unique values =", length(unique(vals)),
+    "\n"
+  )
+}
+
+
+
+cv_nn_poisson <- function(data, hidden_architectures, folds,
+                          n_cores = parallel::detectCores() - 1) {
+  
+  # Copie avec noms safe
+  data_safe <- data
+  names(data_safe) <- make.names(names(data_safe), unique = TRUE)
+  
+  predictor_names <- setdiff(
+    names(data_safe),
+    c("target", "logexposure", "freq", "exposure")
+  )
+  missing_global <- setdiff(predictor_names, names(data_safe))
+  if (length(missing_global)) stop("Colonnes manquantes globalement: ", paste(missing_global, collapse=", "))
+  
+  
+  cl <- parallel::makeCluster(n_cores)
+  doParallel::registerDoParallel(cl)
+  
+  results_list <- list()
+  
+  for (arch_idx in seq_along(hidden_architectures)) {
+    hidden    <- hidden_architectures[[arch_idx]]
+    arch_name <- paste("Arch", arch_idx, ":", paste(hidden, collapse = "-"))
+    cat("\nTesting architecture:", hidden, "\n")
+    
+    dev <- foreach::foreach(
+      k = seq_along(folds),
+      .combine  = c,
+      .packages = c("neuralnet"),
+      .export   = c("predictor_names"),   
+      .noexport = character(0)
+    ) %dopar% {
+      set.seed(123)
+      test_idx  <- folds[[k]]
+      train_idx <- setdiff(seq_len(nrow(data_safe)), test_idx)
+      
+      train_k <- data_safe[train_idx, , drop = FALSE]
+      test_k  <- data_safe[test_idx,  , drop = FALSE]
+      
+      tryCatch({
+        formula_nn <- reformulate(
+          termlabels = predictor_names,
+          response   = "freq"
+        )
+        
+        nn_model <-try(neuralnet::neuralnet(
+          formula       = formula_nn,
+          data          = train_k,
+          hidden        = hidden,
+          linear.output = TRUE,
+          err.fct       = "sse",
+          act.fct       = "logistic",
+          algorithm     = "rprop+",
+          rep           = 1,
+          stepmax       = 2e7,
+          lifesign      = "none",
+          threshold     = 0.05 
+        ), silent = TRUE)
+        if (inherits(nn_model, "try-error") || is.null(nn_model$weights)) return(NA_real_)
+        
+        preds <- try(neuralnet::compute(
+          nn_model, test_k[, predictor_names, drop = FALSE]
+        ), silent = TRUE)
+        if (inherits(preds, "try-error") || is.null(preds$net.result)) return(NA_real_)
+        
+        freq_hat <- as.numeric(preds$net.result)
+        
+        mu_hat <- freq_hat * test_k$exposure
+        mu_hat <- pmax(mu_hat, 1e-10)
+        y_i    <- test_k$target
+        
+        deviance <- 2 * sum(
+          ifelse(y_i == 0, 0, y_i * log(y_i / mu_hat)) - (y_i - mu_hat)
+        )
+        
+        deviance
+        
+        
+      }, error = function(e) {
+        message(sprintf("[PAR ERROR] %s fold %d: %s", arch_name, k, conditionMessage(e)))
+        cat("[PAR ERROR] Arch", arch_name, "fold", k, ":", conditionMessage(e), "\n")
+        return(NA_real_)
+      })
+    }
+    
+    results_list[[arch_name]] <- list(
+      architecture  = hidden,
+      mean_deviance = mean(dev, na.rm = TRUE),
+      sd_deviance   = stats::sd(dev,  na.rm = TRUE),
+      failed_folds  = sum(is.na(dev)),
+      all_deviances = dev
+    )
+    
+    cat("  Mean deviance:", mean(dev, na.rm = TRUE),
+        " | failed folds:", sum(is.na(dev)), "/", length(dev), "\n")  }
+  
+  parallel::stopCluster(cl)
+  
+  results_df <- data.frame(
+    architecture  = sapply(results_list, function(x) paste(x$architecture, collapse = "-")),
+    mean_deviance = sapply(results_list, function(x) x$mean_deviance),
+    sd_deviance   = sapply(results_list, function(x) x$sd_deviance),
+    row.names     = names(results_list),
+    stringsAsFactors = FALSE
+  )
+  
+  return(list(results = results_df, details = results_list))
+}
+
+# Test with just one fold and simple architecture
+test_folds <- list(1:1000)  # Use only first 1000 observations
+test_arch <- list(c(3))
+
+
+# If that works, test parallel version with same data
+cv_test <- cv_nn_poisson(train_nn[1:2000, ], c(1), folds, n_cores = 2)
+architectures <- list(
+  c(1),           c(2),         
+  c(3),        
+  c(4)      # 2 couches: 15 puis 8 neurones
+)
+cv_results <- cv_nn_poisson( train_nn, architectures,  folds )
+best_idx <- which.min(cv_results$results$mean_deviance)
+best_arch <- architectures[[best_idx]]
+# Fonction pour entraîner le modèle final
+train_final_nn_model <- function(train_data, val_data, hidden_architecture, 
+                                 learningrate = 0.01, epochs = 1000) {
+  
+  predictor_names <- setdiff(names(train_data), c("target", "exposure", "freq"))
+  formula_nn <- as.formula(paste("freq ~", paste(predictor_names, collapse = " + ")))
+  
+  # Entraîner le modèle final
+  final_model <- neuralnet(
+    formula = formula_nn,
+    data = train_data,
+    hidden = hidden_architecture,
+    linear.output = TRUE,
+    err.fct = "sse",
+    act.fct = "logistic",
+    algorithm = "rprop+",  # Rprop+ pour la stabilité
+    learningrate = learningrate,
+    rep = 3,  # Plusieurs répétitions
+    stepmax = epochs,
+    lifesign = "full"
+  )
+  
+  # Prédictions sur validation
+  val_predictions <- compute(final_model, val_data[, predictor_names, drop = FALSE])
+  freq_pred_val <- as.numeric(val_predictions$net.result)
+  freq_pred_val[freq_pred_val < 0] <- 1e-10
+  
+  # Calculer la déviance sur validation
+  mu_pred_val <- freq_pred_val * val_data$exposure
+  y_obs_val <- val_data$target
+  
+  deviance_val <- 2 * sum(
+    ifelse(y_obs_val == 0, 0, y_obs_val * log(y_obs_val / mu_pred_val)) - 
+      (y_obs_val - mu_pred_val)
+  )
+  
+  cat("Déviance sur ensemble de validation:", deviance_val, "\n")
+  
+  return(list(
+    model = final_model,
+    validation_deviance = deviance_val,
+    predictions = freq_pred_val
+  ))
+}
+
+# EXEMPLE D'UTILISATION
+
+
+
+# 2. Définir les architectures à tester
+# Une couche cachée
+one_layer_archs <- list(
+  c(3),   # 3 neurones
+  c(5),   # 5 neurones
+  c(7),   # 7 neurones
+  c(10),  # 10 neurones
+  c(15),  # 15 neurones
+  c(20)   # 20 neurones
+)
+
+# Deux couches cachées
+two_layer_archs <- list(
+  c(5, 3),    # 5 puis 3 neurones
+  c(7, 4),    # 7 puis 4 neurones
+  c(10, 5),   # 10 puis 5 neurones
+  c(15, 8),   # 15 puis 8 neurones
+  c(20, 10),  # 20 puis 10 neurones
+  c(7, 7)     # 7 puis 7 neurones
+)
+
+# Combiner toutes les architectures
+all_architectures <- c(one_layer_archs, two_layer_archs)
+
+# 3. Exécuter la validation croisée
+set.seed(123)
+best_results <- find_best_nn_architecture(
+  data = Cdata_nn[train_index, ],
+  hidden_architectures = all_architectures,
+  n_folds = 5,
+  n_cores = detectCores() - 1
+)
+
+# 4. Entraîner le modèle final avec la meilleure architecture
+final_model_result <- train_final_nn_model(
+  train_data = Cdata_nn[train_index, ],
+  val_data = Cdata_nn[-train_index, ],
+  hidden_architecture = best_results$best_architecture,
+  learningrate = 0.01,
+  epochs = 1000
+)
+
+# 5. Comparer avec un modèle de référence (Poisson GLM)
+compare_with_poisson <- function(nn_result, data_nn, train_idx, val_idx) {
+  # Préparer les données pour GLM
+  predictor_names <- setdiff(names(data_nn), c("target", "exposure", "freq"))
+  
+  # Poisson GLM
+  poisson_formula <- as.formula(
+    paste("target ~", paste(predictor_names, collapse = " + "), 
+          "+ offset(log(exposure))")
+  )
+  
+  poisson_model <- glm(poisson_formula, 
+                       data = data_nn[train_idx, ],
+                       family = poisson(link = "log"))
+  
+  # Prédictions Poisson
+  poisson_pred <- predict(poisson_model, 
+                          newdata = data_nn[val_idx, ],
+                          type = "response")
+  
+  # Déviance Poisson
+  y_obs <- data_nn$target[val_idx]
+  poisson_deviance <- 2 * sum(
+    ifelse(y_obs == 0, 0, y_obs * log(y_obs / poisson_pred)) - 
+      (y_obs - poisson_pred)
+  )
+  
+  cat("\n=== COMPARAISON ===\n")
+  cat("Réseau de neurones - Déviance:", nn_result$validation_deviance, "\n")
+  cat("Poisson GLM - Déviance:", poisson_deviance, "\n")
+  cat("Différence:", nn_result$validation_deviance - poisson_deviance, "\n")
+  
+  return(list(
+    poisson_model = poisson_model,
+    poisson_deviance = poisson_deviance,
+    comparison = data.frame(
+      model = c("Neural Network", "Poisson GLM"),
+      deviance = c(nn_result$validation_deviance, poisson_deviance)
+    )
+  ))
+}
+
+# Exécuter la comparaison
+comparison <- compare_with_poisson(
+  final_model_result,
+  Cdata_nn,
+  train_index,
+  setdiff(1:nrow(Cdata_nn), train_index)
+)
+
+
+cv_nn_poisson_seq <- function(data, hidden_architectures, folds) {
+  data_safe <- data
+  names(data_safe) <- make.names(names(data_safe), unique = TRUE)
+  
+  predictor_names <- setdiff(
+    names(data_safe),
+    c("target", "logexposure", "freq", "exposure")
+  )
+  
+  results_list <- list()
+  
+  for (arch_idx in seq_along(hidden_architectures)) {
+    hidden    <- hidden_architectures[[arch_idx]]
+    arch_name <- paste("Arch", arch_idx, ":", paste(hidden, collapse = "-"))
+    cat("\n[SEQ] Testing architecture:", arch_name, "\n")
+    
+    dev <- c()
+    
+    for (k in seq_along(folds)) {
+      cat("[SEQ]  Fold", k, "\n")
+      
+      test_idx  <- folds[[k]]
+      train_idx <- setdiff(seq_len(nrow(data_safe)), test_idx)
+      
+      train_k <- data_safe[train_idx, ]
+      test_k  <- data_safe[test_idx, ]
+      
+      formula_nn <- reformulate(
+        termlabels = predictor_names,
+        response   = "freq"
+      )
+      
+      cat("[SEQ]   Fitting neural net...\n")
+      nn_model <- neuralnet::neuralnet(
+        formula       = formula_nn,
+        data          = train_k,
+        hidden        = hidden,
+        linear.output = TRUE,
+        err.fct       = "sse",
+        act.fct       = "logistic",
+        algorithm     = "rprop+",
+        rep           = 3,
+        stepmax       = 1e5,
+        lifesign      = "none"
+      )
+      
+      cat("[SEQ]   Predicting...\n")
+      preds <- neuralnet::compute(
+        nn_model,
+        test_k[, predictor_names, drop = FALSE]
+      )
+      freq_hat <- as.numeric(preds$net.result)
+      
+      mu_hat <- freq_hat * test_k$exposure
+      mu_hat <- pmax(mu_hat, 1e-10)
+      y_i    <- test_k$target
+      
+      deviance <- 2 * sum(
+        ifelse(y_i == 0, 0, y_i * log(y_i / mu_hat)) - (y_i - mu_hat)
+      )
+      
+      dev <- c(dev, deviance)
+    }
+    
+    results_list[[arch_name]] <- list(
+      architecture  = hidden,
+      mean_deviance = mean(dev),
+      sd_deviance   = stats::sd(dev),
+      all_deviances = dev
+    )
+    
+    cat("[SEQ]  Mean deviance:", mean(dev), "\n")
+  }
+  
+  results_df <- data.frame(
+    architecture  = sapply(results_list, function(x) paste(x$architecture, collapse = "-")),
+    mean_deviance = sapply(results_list, function(x) x$mean_deviance),
+    sd_deviance   = sapply(results_list, function(x) x$sd_deviance),
+    row.names     = names(results_list),
+    stringsAsFactors = FALSE
+  )
+  
+  list(results = results_df, details = results_list)
+}
+cv_seq <- cv_nn_poisson_seq(train_nn, list(c(5)), folds)
+
